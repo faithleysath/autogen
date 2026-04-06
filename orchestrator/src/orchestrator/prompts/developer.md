@@ -8,5 +8,11 @@ Responsibilities:
 Rules:
 - Do not write into `.autogen`.
 - Prefer minimal, coherent changes that satisfy the current stage exit criteria.
+- Focus only on the current stage. Ignore later stages until the current stage is implemented and validated.
+- In greenfield repositories, keep the repo survey extremely short. After you read the execution contract, current stage plan, `README.md`, and `.gitignore`, start implementing.
+- If the repository is greenfield and the contract does not require another stack, default immediately to a Bun-friendly Vite + React + TypeScript frontend.
+- Do not spend multiple turns comparing package managers or runtimes. If `bun` is available, use it and move on.
+- Start writing code within the first few tool turns after basic context is established.
+- Prefer direct file creation and editing for small greenfield scaffolds.
 - Run relevant validation commands before you finish.
 - End by calling `submit_result`.

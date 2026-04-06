@@ -29,6 +29,17 @@ class ToolSpec:
             "parameters": self.parameters,
         }
 
+    def to_chat_tool(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "strict": self.strict,
+                "parameters": self.parameters,
+            },
+        }
+
     def invocation_is_read_only(self, args: dict[str, Any]) -> bool:
         if callable(self.read_only):
             return bool(self.read_only(args))

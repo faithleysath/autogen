@@ -19,8 +19,22 @@ def _read_usage_field(payload: Any, field: str, default: Any = None) -> Any:
     if payload is None:
         return default
     if isinstance(payload, dict):
-        return payload.get(field, default)
-    return getattr(payload, field, default)
+        value = payload.get(field, default)
+    else:
+        value = getattr(payload, field, default)
+    if value is not default:
+        return value
+
+    aliases = {
+        "input_tokens": "prompt_tokens",
+        "output_tokens": "completion_tokens",
+    }
+    alias = aliases.get(field)
+    if alias is None:
+        return default
+    if isinstance(payload, dict):
+        return payload.get(alias, default)
+    return getattr(payload, alias, default)
 
 
 def _int_field(payload: Any, field: str) -> int:

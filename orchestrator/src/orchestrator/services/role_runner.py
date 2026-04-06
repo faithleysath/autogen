@@ -4,9 +4,12 @@ import asyncio
 import json
 import logging
 import random
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
+import httpx
 from langsmith import Client
 from openai import AsyncOpenAI
 from langsmith.wrappers import wrap_openai
@@ -55,6 +58,92 @@ def _require_frontmatter_value(
         raise RuntimeError(f"{path} frontmatter field {field!r} expected {expected!r}, got {actual!r}")
 
 
+def _first_present(meta: dict[str, Any], *fields: str) -> Any:
+    for field in fields:
+        value = meta.get(field)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _control_timestamp(meta: dict[str, Any]) -> str:
+    value = _first_present(meta, "created_at")
+    if value is not None:
+        return str(value)
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _normalize_stage_gate_meta(
+    meta: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    decision: str,
+) -> dict[str, Any]:
+    return {
+        "kind": str(_first_present(meta, "kind") or "gate_decision"),
+        "run_id": str(_first_present(meta, "run_id") or state["run_id"]),
+        "cycle": _first_present(meta, "cycle", "cycle_no") or state["cycle_no"],
+        "stage": _first_present(meta, "stage", "stage_no", "stage_id") or state["stage_no"],
+        "attempt": _first_present(meta, "attempt", "attempt_no") or state["attempt_no"],
+        "role": str(_first_present(meta, "role") or "stage_gate"),
+        "created_at": _control_timestamp(meta),
+        "decision": str(_first_present(meta, "decision", "verdict", "result") or decision),
+        "status": str(_first_present(meta, "status") or ("FAIL" if decision == "FAIL" else "PASS")),
+    }
+
+
+def _normalize_review_meta(
+    meta: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    role: str,
+    verdict: str,
+) -> dict[str, Any]:
+    return {
+        "kind": str(_first_present(meta, "kind") or f"{role}_report"),
+        "run_id": str(_first_present(meta, "run_id") or state["run_id"]),
+        "release": _first_present(meta, "release", "release_no") or state["release_no"],
+        "role": str(_first_present(meta, "role") or role),
+        "created_at": _control_timestamp(meta),
+        "candidate_code_sha": str(
+            _first_present(meta, "candidate_code_sha", "code_sha", "commit_sha")
+            or state["candidate_code_sha"]
+        ),
+        "status": str(_first_present(meta, "status") or verdict),
+        "verdict": str(_first_present(meta, "verdict", "decision", "result") or verdict),
+    }
+
+
+def _normalize_release_decision_meta(
+    meta: dict[str, Any],
+    *,
+    state: dict[str, Any],
+    decision: str,
+) -> dict[str, Any]:
+    return {
+        "kind": str(_first_present(meta, "kind") or "release_decision"),
+        "run_id": str(_first_present(meta, "run_id") or state["run_id"]),
+        "release": _first_present(meta, "release", "release_no") or state["release_no"],
+        "role": str(_first_present(meta, "role") or "release_gate"),
+        "created_at": _control_timestamp(meta),
+        "decision": str(_first_present(meta, "decision", "verdict", "result") or decision),
+    }
+
+
+def _normalize_rework_summary_meta(
+    meta: dict[str, Any],
+    *,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "kind": str(_first_present(meta, "kind") or "rework_summary"),
+        "run_id": str(_first_present(meta, "run_id") or state["run_id"]),
+        "release": _first_present(meta, "release", "release_no") or state["release_no"],
+        "role": str(_first_present(meta, "role") or "release_gate"),
+        "created_at": _control_timestamp(meta),
+    }
+
+
 class RoleRunnerProtocol(Protocol):
     async def run_architect(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]: ...
 
@@ -101,7 +190,10 @@ class OpenAIRoleRunner:
         self._git = git_service
         self._background_tasks = background_tasks
         if config.openai_api_key:
-            openai_client = AsyncOpenAI(api_key=config.openai_api_key)
+            client_kwargs = {"api_key": config.openai_api_key}
+            if config.openai_base_url:
+                client_kwargs["base_url"] = config.openai_base_url
+            openai_client = AsyncOpenAI(**client_kwargs)
             if langsmith_client is not None:
                 openai_client = wrap_openai(
                     openai_client,
@@ -186,7 +278,7 @@ class OpenAIRoleRunner:
         specs.extend(
             FileToolset(
                 context,
-                include_write_tools=role in {"architect", "developer"},
+                include_write_tools=role in {"architect", "developer", "e2e"},
             ).specs()
         )
         specs.extend(ArtifactToolset(context, self._artifact_service).specs())
@@ -197,6 +289,8 @@ class OpenAIRoleRunner:
         return {spec.name: spec for spec in specs}
 
     def _is_retryable_error(self, exc: Exception) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
         status_code = getattr(exc, "status_code", None)
         if status_code in {408, 409, 429, 500, 502, 503, 504}:
             return True
@@ -218,7 +312,48 @@ class OpenAIRoleRunner:
     ):
         for attempt in range(MAX_RESPONSE_RETRIES):
             try:
+                request_kwargs = {
+                    **request_kwargs,
+                    "timeout": httpx.Timeout(self._config.openai_response_timeout_seconds),
+                }
                 response = await self._client.responses.create(**request_kwargs)
+                async with asyncio.timeout(self._config.openai_response_timeout_seconds):
+                    final_response = await self._coerce_response(response)
+                usage.add_response(final_response, pricing_by_model=self._config.model_pricing)
+                return final_response
+            except Exception as exc:
+                if attempt >= MAX_RESPONSE_RETRIES - 1 or not self._is_retryable_error(exc):
+                    raise
+                usage.add_retry()
+                delay = min(8.0, (2**attempt) + random.uniform(0.0, 0.5))
+                logger.warning(
+                    "role_model_retry",
+                    extra={
+                        "role": role,
+                        "model": model,
+                        "attempt": attempt + 1,
+                        "delay_seconds": delay,
+                        "error": str(exc),
+                    },
+                )
+                await asyncio.sleep(delay)
+
+    async def _create_chat_completion_with_retry(
+        self,
+        *,
+        usage: RoleUsage,
+        role: str,
+        model: str,
+        request_kwargs: dict[str, Any],
+    ):
+        for attempt in range(MAX_RESPONSE_RETRIES):
+            try:
+                response = await self._client.chat.completions.create(
+                    **{
+                        **request_kwargs,
+                        "timeout": httpx.Timeout(self._config.openai_response_timeout_seconds),
+                    }
+                )
                 usage.add_response(response, pricing_by_model=self._config.model_pricing)
                 return response
             except Exception as exc:
@@ -238,6 +373,64 @@ class OpenAIRoleRunner:
                 )
                 await asyncio.sleep(delay)
 
+    async def _coerce_response(self, response):
+        if hasattr(response, "output") and hasattr(response, "id"):
+            return response
+        if hasattr(response, "__aiter__"):
+            final_response = None
+            try:
+                async for event in response:
+                    if getattr(event, "type", None) == "response.completed":
+                        final_response = event.response
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    maybe_awaitable = close()
+                    if hasattr(maybe_awaitable, "__await__"):
+                        await maybe_awaitable
+            if final_response is None:
+                raise RuntimeError("response stream ended without a response.completed event")
+            return final_response
+        return response
+
+    def _normalize_response_input(self, payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, str):
+            return [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": payload}],
+                }
+            ]
+        raise TypeError(f"unsupported response input payload type: {type(payload).__name__}")
+
+    def _build_chat_messages(self, *, system_prompt: str, user_prompt: str) -> list[dict[str, Any]]:
+        combined_prompt = (
+            "Follow the role instructions exactly.\n\n"
+            "[Role Instructions]\n"
+            f"{system_prompt}\n\n"
+            "[Task Payload]\n"
+            f"{user_prompt}"
+        )
+        return [{"role": "user", "content": combined_prompt}]
+
+    def _history_items_from_response(self, response) -> list[dict[str, Any]]:
+        history_items: list[dict[str, Any]] = []
+        for item in getattr(response, "output", []):
+            if getattr(item, "type", None) != "function_call":
+                continue
+            history_items.append(
+                {
+                    "type": "function_call",
+                    "call_id": item.call_id,
+                    "name": item.name,
+                    "arguments": item.arguments,
+                }
+            )
+        return history_items
+
     async def _execute_tool_call(
         self,
         *,
@@ -251,7 +444,12 @@ class OpenAIRoleRunner:
         tool_spec = tools[item.name]
         logger.info(
             "role_tool_call",
-            extra={"role": role, "tool_name": item.name, "workspace_id": workspace.workspace_id},
+            extra={
+                "role": role,
+                "tool_name": item.name,
+                "workspace_id": workspace.workspace_id,
+                "tool_args_preview": json.dumps(parsed_args, ensure_ascii=False)[:1000],
+            },
         )
         async with traced_block(
             enabled=self._langsmith_client is not None,
@@ -262,13 +460,32 @@ class OpenAIRoleRunner:
             tags=["autogen", "orchestrator", role, "tool"],
             client=self._langsmith_client,
         ) as tool_trace:
-            tool_result = await tool_spec.handler(parsed_args)
-            if tool_trace is not None:
-                tool_trace.end(
-                    outputs={
-                        "result_preview": json.dumps(tool_result, ensure_ascii=False)[:4000]
-                    }
+            try:
+                tool_result = await tool_spec.handler(parsed_args)
+            except Exception as exc:
+                tool_result = {
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                }
+                logger.warning(
+                    "role_tool_call_failed",
+                    extra={
+                        "role": role,
+                        "tool_name": item.name,
+                        "workspace_id": workspace.workspace_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
                 )
+                if tool_trace is not None:
+                    tool_trace.end(outputs={"error": tool_result})
+            else:
+                if tool_trace is not None:
+                    tool_trace.end(
+                        outputs={
+                            "result_preview": json.dumps(tool_result, ensure_ascii=False)[:4000]
+                        }
+                    )
         return {
             "type": "function_call_output",
             "call_id": item.call_id,
@@ -297,6 +514,43 @@ class OpenAIRoleRunner:
             state=state,
             result_schema=result_schema,
         )
+        if self._config.openai_api_mode == "chat_completions":
+            return await self._run_role_chat_completions(
+                role=role,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                state=state,
+                workspace=workspace,
+                container_id=container_id,
+                tools=tools,
+            )
+        if self._config.openai_api_mode != "responses":
+            raise RuntimeError(f"unsupported OPENAI API mode: {self._config.openai_api_mode}")
+        return await self._run_role_responses(
+            role=role,
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+            tools=tools,
+        )
+
+    async def _run_role_responses(
+        self,
+        *,
+        role: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+        tools: dict[str, ToolSpec],
+    ) -> dict[str, Any]:
+        input_history = self._normalize_response_input(user_prompt)
         usage = RoleUsage(model=model)
         async with traced_block(
             enabled=self._langsmith_client is not None,
@@ -330,8 +584,9 @@ class OpenAIRoleRunner:
                 request_kwargs={
                     "model": model,
                     "instructions": system_prompt,
-                    "input": user_prompt,
+                    "input": input_history,
                     "tools": [spec.to_openai_tool() for spec in tools.values()],
+                    "stream": True,
                 },
             )
             logger.info(
@@ -402,16 +657,214 @@ class OpenAIRoleRunner:
                     usage=usage,
                     role=role,
                     model=model,
+                    request_kwargs=self._followup_request_kwargs(
+                        model=model,
+                        system_prompt=system_prompt,
+                        response=response,
+                        input_history=input_history,
+                        tool_outputs=tool_outputs,
+                        tools=tools,
+                    ),
+                )
+
+        raise RuntimeError(f"{role} exceeded the maximum number of tool iterations")
+
+    async def _run_role_chat_completions(
+        self,
+        *,
+        role: str,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+        tools: dict[str, ToolSpec],
+    ) -> dict[str, Any]:
+        messages = self._build_chat_messages(system_prompt=system_prompt, user_prompt=user_prompt)
+        usage = RoleUsage(model=model)
+        async with traced_block(
+            enabled=self._langsmith_client is not None,
+            name=f"role.{role}",
+            run_type="chain",
+            inputs={
+                "role": role,
+                "workspace_id": workspace.workspace_id,
+                "container_id": container_id,
+                "state": {
+                    "run_id": state.get("run_id"),
+                    "cycle_no": state.get("cycle_no"),
+                    "stage_no": state.get("stage_no"),
+                    "attempt_no": state.get("attempt_no"),
+                    "release_no": state.get("release_no"),
+                },
+            },
+            metadata={
+                "role": role,
+                "model": model,
+                "workspace_id": workspace.workspace_id,
+                "container_id": container_id,
+            },
+            tags=["autogen", "orchestrator", role],
+            client=self._langsmith_client,
+        ) as role_trace:
+            response = await self._create_chat_completion_with_retry(
+                usage=usage,
+                role=role,
+                model=model,
+                request_kwargs={
+                    "model": model,
+                    "messages": messages,
+                    "tools": [spec.to_chat_tool() for spec in tools.values()],
+                    "tool_choice": "required",
+                    "parallel_tool_calls": True,
+                    "stream": False,
+                },
+            )
+            logger.info(
+                "role_started",
+                extra={
+                    "role": role,
+                    "model": model,
+                    "workspace_id": workspace.workspace_id,
+                    "container_id": container_id,
+                },
+            )
+
+            for step in range(64):
+                choice = response.choices[0]
+                message = choice.message
+                tool_calls = list(getattr(message, "tool_calls", None) or [])
+                if not tool_calls:
+                    raise RuntimeError(
+                        f"{role} did not call submit_result. Final model text:\n{getattr(message, 'content', '')}"
+                    )
+
+                assistant_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": item.id,
+                            "type": "function",
+                            "function": {
+                                "name": item.function.name,
+                                "arguments": item.function.arguments,
+                            },
+                        }
+                        for item in tool_calls
+                    ],
+                }
+                if getattr(message, "content", None):
+                    assistant_message["content"] = message.content
+                messages.append(assistant_message)
+
+                pending_tool_calls: list[tuple[Any, dict[str, Any]]] = []
+                for item in tool_calls:
+                    raw_args = item.function.arguments if isinstance(item.function.arguments, str) else json.dumps(
+                        item.function.arguments
+                    )
+                    parsed_args = json.loads(raw_args or "{}")
+                    if item.function.name == "submit_result":
+                        parsed_args["usage"] = usage.to_dict()
+                        if role_trace is not None:
+                            role_trace.end(outputs={"result": parsed_args})
+                        logger.info(
+                            "role_completed",
+                            extra={
+                                "role": role,
+                                "workspace_id": workspace.workspace_id,
+                                "iterations": step + 1,
+                                "usage": usage.to_dict(),
+                            },
+                        )
+                        return parsed_args
+                    pending_tool_calls.append(
+                        (
+                            SimpleNamespace(
+                                name=item.function.name,
+                                arguments=item.function.arguments,
+                                call_id=item.id,
+                            ),
+                            parsed_args,
+                        )
+                    )
+
+                if all(tools[item.name].invocation_is_read_only(args) for item, args in pending_tool_calls):
+                    tool_outputs = list(
+                        await asyncio.gather(
+                            *[
+                                self._execute_tool_call(
+                                    role=role,
+                                    workspace=workspace,
+                                    tools=tools,
+                                    item=item,
+                                )
+                                for item, _ in pending_tool_calls
+                            ]
+                        )
+                    )
+                else:
+                    tool_outputs = []
+                    for item, _ in pending_tool_calls:
+                        tool_outputs.append(
+                            await self._execute_tool_call(
+                                role=role,
+                                workspace=workspace,
+                                tools=tools,
+                                item=item,
+                            )
+                        )
+
+                for output in tool_outputs:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": output["call_id"],
+                            "content": output["output"],
+                        }
+                    )
+
+                response = await self._create_chat_completion_with_retry(
+                    usage=usage,
+                    role=role,
+                    model=model,
                     request_kwargs={
                         "model": model,
-                        "instructions": system_prompt,
-                        "previous_response_id": response.id,
-                        "input": tool_outputs,
-                        "tools": [spec.to_openai_tool() for spec in tools.values()],
+                        "messages": messages,
+                        "tools": [spec.to_chat_tool() for spec in tools.values()],
+                        "tool_choice": "required",
+                        "parallel_tool_calls": True,
+                        "stream": False,
                     },
                 )
 
         raise RuntimeError(f"{role} exceeded the maximum number of tool iterations")
+
+    def _followup_request_kwargs(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        response,
+        input_history: list[dict[str, Any]],
+        tool_outputs: list[dict[str, Any]],
+        tools: dict[str, ToolSpec],
+    ) -> dict[str, Any]:
+        request_kwargs = {
+            "model": model,
+            "instructions": system_prompt,
+            "tools": [spec.to_openai_tool() for spec in tools.values()],
+            "stream": True,
+        }
+        if self._config.openai_stateless_responses:
+            input_history.extend(self._history_items_from_response(response))
+            input_history.extend(tool_outputs)
+            request_kwargs["input"] = input_history
+            return request_kwargs
+
+        request_kwargs["previous_response_id"] = response.id
+        request_kwargs["input"] = tool_outputs
+        return request_kwargs
 
     async def run_architect(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
         cycle_no = state["cycle_no"]
@@ -605,6 +1058,19 @@ class OpenAIRoleRunner:
         )
         _require_path(result["gate_path"], gate_path, label="stage gate artifact")
         artifact = self._artifact_service.read_artifact(workspace, result["gate_path"])
+        normalized_meta = _normalize_stage_gate_meta(
+            artifact.meta,
+            state=state,
+            decision=result["decision"],
+        )
+        if normalized_meta != artifact.meta:
+            self._artifact_service.write_artifact(
+                workspace,
+                result["gate_path"],
+                normalized_meta,
+                artifact.body,
+            )
+            artifact = self._artifact_service.read_artifact(workspace, result["gate_path"])
         _require_frontmatter_fields(
             artifact.meta,
             path=result["gate_path"],
@@ -664,16 +1130,21 @@ class OpenAIRoleRunner:
     ) -> dict[str, Any]:
         release_no = state["release_no"]
         report_path = f"/workspace/.autogen/runs/{state['run_id']}/30-reviews/release-{release_no:03d}/{role}/report.md"
+        prompt_payload = {
+            "run_id": state["run_id"],
+            "release_no": release_no,
+            "candidate_code_sha": state["candidate_code_sha"],
+            "execution_contract_path": state["execution_contract_path"],
+            "e2e_plan_path": state.get("e2e_plan_path"),
+            "required_report_path": report_path,
+            "allowed_verdicts": ["PASS", "FAIL", "PARTIAL"],
+        }
+        if role == "e2e":
+            prompt_payload["evidence_dir"] = (
+                f"/workspace/.autogen/runs/{state['run_id']}/30-reviews/release-{release_no:03d}/e2e/evidence"
+            )
         user_prompt = json.dumps(
-            {
-                "run_id": state["run_id"],
-                "release_no": release_no,
-                "candidate_code_sha": state["candidate_code_sha"],
-                "execution_contract_path": state["execution_contract_path"],
-                "e2e_plan_path": state.get("e2e_plan_path"),
-                "required_report_path": report_path,
-                "allowed_verdicts": ["PASS", "FAIL", "PARTIAL"],
-            },
+            prompt_payload,
             ensure_ascii=False,
             indent=2,
         )
@@ -698,10 +1169,24 @@ class OpenAIRoleRunner:
         )
         _require_path(result["report_path"], report_path, label=f"{role} report")
         artifact = self._artifact_service.read_artifact(workspace, result["report_path"])
+        normalized_meta = _normalize_review_meta(
+            artifact.meta,
+            state=state,
+            role=role,
+            verdict=result["verdict"],
+        )
+        if normalized_meta != artifact.meta:
+            self._artifact_service.write_artifact(
+                workspace,
+                result["report_path"],
+                normalized_meta,
+                artifact.body,
+            )
+            artifact = self._artifact_service.read_artifact(workspace, result["report_path"])
         _require_frontmatter_fields(
             artifact.meta,
             path=result["report_path"],
-            fields=["kind", "run_id", "release", "role", "candidate_code_sha", "status", "verdict"],
+            fields=["kind", "run_id", "release", "role", "created_at", "candidate_code_sha", "status", "verdict"],
         )
         _require_frontmatter_value(
             artifact.meta,
@@ -777,6 +1262,19 @@ class OpenAIRoleRunner:
         rework_path = f"/workspace/.autogen/runs/{state['run_id']}/50-rework/release-{release_no:03d}/rework-summary.md"
         _require_path(result["decision_path"], decision_path, label="release decision")
         decision_artifact = self._artifact_service.read_artifact(workspace, result["decision_path"])
+        normalized_decision_meta = _normalize_release_decision_meta(
+            decision_artifact.meta,
+            state=state,
+            decision=result["decision"],
+        )
+        if normalized_decision_meta != decision_artifact.meta:
+            self._artifact_service.write_artifact(
+                workspace,
+                result["decision_path"],
+                normalized_decision_meta,
+                decision_artifact.body,
+            )
+            decision_artifact = self._artifact_service.read_artifact(workspace, result["decision_path"])
         _require_frontmatter_fields(
             decision_artifact.meta,
             path=result["decision_path"],
@@ -804,6 +1302,18 @@ class OpenAIRoleRunner:
         if result["decision"] == "REWORK":
             _require_path(result["rework_summary_path"], rework_path, label="rework summary")
             rework_artifact = self._artifact_service.read_artifact(workspace, result["rework_summary_path"])
+            normalized_rework_meta = _normalize_rework_summary_meta(
+                rework_artifact.meta,
+                state=state,
+            )
+            if normalized_rework_meta != rework_artifact.meta:
+                self._artifact_service.write_artifact(
+                    workspace,
+                    result["rework_summary_path"],
+                    normalized_rework_meta,
+                    rework_artifact.body,
+                )
+                rework_artifact = self._artifact_service.read_artifact(workspace, result["rework_summary_path"])
             _require_frontmatter_fields(
                 rework_artifact.meta,
                 path=result["rework_summary_path"],

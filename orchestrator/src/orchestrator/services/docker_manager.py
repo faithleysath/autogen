@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 import docker
-from docker.errors import NotFound
+from docker.errors import APIError, NotFound
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.models.runtime import ContainerHandle, ExecResult, WorkspaceView
@@ -111,7 +111,20 @@ class DockerManager:
                 stderr=(stderr_bytes or b"").decode("utf-8", errors="replace"),
             )
 
-        result = await asyncio.wait_for(asyncio.to_thread(_run_exec), timeout=timeout_seconds)
+        deadline = asyncio.get_running_loop().time() + min(
+            timeout_seconds,
+            self._config.container_start_timeout_seconds,
+        )
+        while True:
+            try:
+                result = await asyncio.wait_for(asyncio.to_thread(_run_exec), timeout=timeout_seconds)
+                break
+            except APIError as exc:
+                if "unable to find user autogen" not in str(exc):
+                    raise
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+                await asyncio.sleep(0.25)
         logger.info(
             "container_exec_done",
             extra={

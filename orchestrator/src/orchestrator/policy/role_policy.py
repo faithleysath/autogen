@@ -10,6 +10,7 @@ class RolePolicy:
     writable_prefixes: tuple[str, ...]
     allow_code_write: bool
     allow_command: bool
+    allow_background_tasks: bool
 
     def can_write(self, visible_path: str) -> bool:
         if self.allow_code_write:
@@ -45,6 +46,7 @@ def build_role_policy(
             ),
             allow_code_write=False,
             allow_command=True,
+            allow_background_tasks=False,
         )
     if role == "developer":
         return RolePolicy(
@@ -53,6 +55,7 @@ def build_role_policy(
             writable_prefixes=(),
             allow_code_write=True,
             allow_command=True,
+            allow_background_tasks=True,
         )
     if role == "stage_gate":
         assert stage_no is not None and attempt_no is not None
@@ -64,8 +67,9 @@ def build_role_policy(
             writable_prefixes=(),
             allow_code_write=False,
             allow_command=True,
+            allow_background_tasks=False,
         )
-    if role in {"compliance", "qa", "e2e"}:
+    if role in {"compliance", "qa"}:
         assert release_no is not None
         return RolePolicy(
             role=role,
@@ -75,6 +79,21 @@ def build_role_policy(
             writable_prefixes=(),
             allow_code_write=False,
             allow_command=True,
+            allow_background_tasks=False,
+        )
+    if role == "e2e":
+        assert release_no is not None
+        return RolePolicy(
+            role=role,
+            writable_paths=(
+                f"{run_root}/30-reviews/release-{release_no:03d}/e2e/report.md",
+            ),
+            writable_prefixes=(
+                f"{run_root}/30-reviews/release-{release_no:03d}/e2e/evidence/",
+            ),
+            allow_code_write=False,
+            allow_command=True,
+            allow_background_tasks=True,
         )
     if role == "release_gate":
         assert release_no is not None
@@ -87,5 +106,6 @@ def build_role_policy(
             writable_prefixes=(),
             allow_code_write=False,
             allow_command=False,
+            allow_background_tasks=False,
         )
     raise ValueError(f"unknown role: {role}")

@@ -84,7 +84,7 @@ class TaskToolset:
     async def task_create(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self._context.policy.allow_command:
             raise PermissionError(f"{self._context.role} cannot run commands")
-        if not self._context.policy.allow_code_write:
+        if not self._context.policy.allow_background_tasks:
             raise PermissionError(f"{self._context.role} cannot create background tasks")
         argv = [str(item) for item in args["argv"]]
         _validate_command(argv)

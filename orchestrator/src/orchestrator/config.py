@@ -50,6 +50,10 @@ class OrchestratorConfig:
     review_timeout_seconds: int
     push_lock_timeout_seconds: int
     openai_api_key: str | None
+    openai_base_url: str | None
+    openai_api_mode: str
+    openai_stateless_responses: bool
+    openai_response_timeout_seconds: int
     model_pricing: dict[str, dict[str, float]]
 
     @classmethod
@@ -99,6 +103,12 @@ class OrchestratorConfig:
             review_timeout_seconds=int(os.getenv("AUTOGEN_REVIEW_TIMEOUT_SECONDS", "900")),
             push_lock_timeout_seconds=int(os.getenv("AUTOGEN_PUSH_LOCK_TIMEOUT_SECONDS", "120")),
             openai_api_key=os.getenv("OPENAI_API_KEY") or None,
+            openai_base_url=os.getenv("OPENAI_BASE_URL") or None,
+            openai_api_mode=os.getenv("AUTOGEN_OPENAI_API_MODE", "responses").strip().lower(),
+            openai_stateless_responses=_env_bool("AUTOGEN_OPENAI_STATELESS_RESPONSES", default=False),
+            openai_response_timeout_seconds=int(
+                os.getenv("AUTOGEN_OPENAI_RESPONSE_TIMEOUT_SECONDS", "90")
+            ),
             model_pricing=model_pricing,
         )
 

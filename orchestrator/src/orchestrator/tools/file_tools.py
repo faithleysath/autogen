@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from orchestrator.models.runtime import WorkspaceView
 from orchestrator.tools.base import ToolContext, ToolSpec
+
+
+SURVEY_IGNORED_DIRS = frozenset(
+    {
+        ".autogen",
+        ".git",
+        ".next",
+        ".pytest_cache",
+        ".venv",
+        "__pycache__",
+        "build",
+        "coverage",
+        "dist",
+        "node_modules",
+    }
+)
 
 
 def _line_slice(content: str, start_line: int | None, end_line: int | None) -> str:
@@ -13,6 +30,33 @@ def _line_slice(content: str, start_line: int | None, end_line: int | None) -> s
     end = len(lines) if end_line is None else min(len(lines), end_line)
     numbered = [f"{idx}: {line}" for idx, line in enumerate(lines[start - 1 : end], start=start)]
     return "\n".join(numbered)
+
+
+def _explicit_internal_path(root: Path, workspace_root: Path) -> bool:
+    try:
+        relative_root = root.relative_to(workspace_root)
+    except ValueError:
+        return False
+    return any(part in SURVEY_IGNORED_DIRS for part in relative_root.parts)
+
+
+def _iter_workspace_paths(root: Path, workspace_root: Path) -> list[Path]:
+    if root.is_file():
+        return [root]
+
+    allow_internal_dirs = _explicit_internal_path(root, workspace_root)
+    discovered: list[Path] = []
+    for current_root, dirs, files in os.walk(root):
+        dirs.sort()
+        files.sort()
+        if not allow_internal_dirs:
+            dirs[:] = [dirname for dirname in dirs if dirname not in SURVEY_IGNORED_DIRS]
+        current = Path(current_root)
+        for dirname in dirs:
+            discovered.append(current / dirname)
+        for filename in files:
+            discovered.append(current / filename)
+    return discovered
 
 
 class FileToolset:
@@ -114,13 +158,10 @@ class FileToolset:
         if not backing_path.exists():
             raise FileNotFoundError(visible_path)
         entries: list[str] = []
-        if backing_path.is_file():
-            entries.append(visible_path)
-        else:
-            for path in sorted(backing_path.rglob("*")):
-                if len(entries) >= max_entries:
-                    break
-                entries.append(self._context.workspace.to_visible_path(path))
+        for path in _iter_workspace_paths(backing_path, self._context.workspace.backing_root):
+            if len(entries) >= max_entries:
+                break
+            entries.append(self._context.workspace.to_visible_path(path))
         return {"entries": entries, "truncated": len(entries) >= max_entries}
 
     async def read_file(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -135,7 +176,7 @@ class FileToolset:
         query = args["query"]
         max_results = max(1, min(int(args["max_results"]), 200))
         results: list[dict[str, Any]] = []
-        for path in sorted(root.rglob("*")):
+        for path in _iter_workspace_paths(root, self._context.workspace.backing_root):
             if len(results) >= max_results:
                 break
             if not path.is_file():

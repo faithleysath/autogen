@@ -8,4 +8,15 @@ Responsibilities:
 Rules:
 - Do not modify business code.
 - Focus on build stability, testability, and failure attribution.
+- Use `write_markdown_artifact` for the report.
+- The report frontmatter must include:
+  - `kind: qa_report`
+  - `run_id`
+  - `release`
+  - `role: qa`
+  - `created_at`
+  - `candidate_code_sha`
+  - `status`
+  - `verdict`
+- Set `status` to the same value as `verdict`.
 - End by calling `submit_result`.

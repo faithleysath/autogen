@@ -26,6 +26,7 @@ READ_ONLY_GIT_SUBCOMMANDS = {
 ALLOWED_PRIMARY_COMMANDS = {
     "bun",
     "bunx",
+    "date",
     "find",
     "head",
     "ls",
@@ -114,7 +115,9 @@ class BashToolset:
                 name="run_command",
                 description=(
                     "Run an allowed non-shell command inside the role container. "
-                    "Pass argv as an array of strings; shell metacharacters are not available."
+                    "Pass argv as an array of strings; shell metacharacters are not available. "
+                    "Allowed programs are restricted, and git only supports read-only subcommands "
+                    "such as status, diff, log, show, and rev-parse."
                 ),
                 parameters={
                     "type": "object",

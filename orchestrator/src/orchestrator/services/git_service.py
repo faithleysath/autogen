@@ -49,7 +49,7 @@ class GitService:
             extra={
                 "container_id": container_id,
                 "workspace_id": workspace.workspace_id,
-                "args": args,
+                "git_args": args,
                 "cwd": cwd,
             },
         )
@@ -282,7 +282,12 @@ class GitService:
         commit_sha = await self.current_head(container_id=container_id, workspace=workspace)
         logger.info(
             "git_commit_paths",
-            extra={"workspace_id": workspace.workspace_id, "message": message, "paths": paths, "commit_sha": commit_sha},
+            extra={
+                "workspace_id": workspace.workspace_id,
+                "commit_message": message,
+                "paths": paths,
+                "commit_sha": commit_sha,
+            },
         )
         return commit_sha
 
@@ -311,7 +316,11 @@ class GitService:
         commit_sha = await self.current_head(container_id=container_id, workspace=workspace)
         logger.info(
             "git_commit_all",
-            extra={"workspace_id": workspace.workspace_id, "message": message, "commit_sha": commit_sha},
+            extra={
+                "workspace_id": workspace.workspace_id,
+                "commit_message": message,
+                "commit_sha": commit_sha,
+            },
         )
         return commit_sha
 

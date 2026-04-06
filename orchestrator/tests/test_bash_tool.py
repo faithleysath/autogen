@@ -107,3 +107,26 @@ async def test_run_command_restores_disallowed_workspace_mutations(tmp_path):
         )
 
     assert target.read_text(encoding="utf-8") == "before\n"
+
+
+@pytest.mark.anyio
+async def test_run_command_allows_date_for_read_only_time_lookup(tmp_path):
+    context = _make_context(tmp_path, role="architect")
+    docker = FakeDockerManager()
+    tool = BashToolset(
+        context,
+        docker,
+        FakeGitService([[], []]),
+        SimpleNamespace(review_timeout_seconds=60),
+    )
+
+    result = await tool.run_command(
+        {
+            "argv": ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"],
+            "cwd": "/workspace",
+            "timeout_seconds": 10,
+        }
+    )
+
+    assert result["argv"] == ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]
+    assert docker.calls == [(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], "/workspace")]

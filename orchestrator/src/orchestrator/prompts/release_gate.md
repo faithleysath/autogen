@@ -8,4 +8,18 @@ Responsibilities:
 Rules:
 - Do not modify business code.
 - Base the decision on the written review reports.
+- Use `write_markdown_artifact` for both control files.
+- `decision.md` frontmatter must include:
+  - `kind: release_decision`
+  - `run_id`
+  - `release`
+  - `role: release_gate`
+  - `created_at`
+  - `decision`
+- If the decision is `REWORK`, also write `rework-summary.md` with frontmatter:
+  - `kind: rework_summary`
+  - `run_id`
+  - `release`
+  - `role: release_gate`
+  - `created_at`
 - End by calling `submit_result`.

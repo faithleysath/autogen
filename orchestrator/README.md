@@ -35,12 +35,61 @@ uv run orchestrator run \
   --thread-id demo-run-001
 ```
 
+You can run the orchestrator directly on your local machine. Docker Compose is not required for the orchestrator process itself, but Docker is still required because role workspaces run inside the `autogen-agent-dev` and `autogen-agent-e2e` containers.
+
 ### Required runtime inputs
 
 - `AUTOGEN_WORKSPACE_ROOT`
 - `OPENAI_API_KEY` for live role execution
 - Docker daemon access from the orchestrator container or local process
 - Built `autogen-agent-dev` and `autogen-agent-e2e` images
+
+### OpenAI-compatible providers
+
+The role runner accepts OpenAI-compatible endpoints through `OPENAI_BASE_URL`.
+
+- Use `AUTOGEN_OPENAI_API_MODE=responses` for providers that support the OpenAI Responses API.
+- Use `AUTOGEN_OPENAI_API_MODE=chat_completions` for providers that expose only `/v1/chat/completions`.
+- Some Responses-compatible providers do not support `previous_response_id`; for those, enable stateless response replay with `AUTOGEN_OPENAI_STATELESS_RESPONSES=true`.
+
+Example local run against a generic Responses-compatible provider:
+
+```bash
+cd /Users/laysath/proj/autogen/orchestrator
+
+export AUTOGEN_WORKSPACE_ROOT=/absolute/path/to/workspaces
+export OPENAI_API_KEY=...
+export OPENAI_BASE_URL=https://provider.example.com/v1
+export AUTOGEN_OPENAI_API_MODE=responses
+export AUTOGEN_OPENAI_STATELESS_RESPONSES=true
+export AUTOGEN_OPENAI_RESPONSE_TIMEOUT_SECONDS=90
+export AUTOGEN_MODEL_DEFAULT=gpt-5.4-xhigh
+
+uv run orchestrator run \
+  --repo-url git@github.com:your-org/your-repo.git \
+  --prd-file /absolute/path/to/prd.md \
+  --thread-id demo-run-compatible-provider
+```
+
+Example local run against Right Codes `chat/completions`:
+
+```bash
+cd /Users/laysath/proj/autogen/orchestrator
+
+export AUTOGEN_WORKSPACE_ROOT=/absolute/path/to/workspaces
+export OPENAI_API_KEY=...
+export OPENAI_BASE_URL=https://www.right.codes/codex/v1
+export AUTOGEN_OPENAI_API_MODE=chat_completions
+export AUTOGEN_OPENAI_RESPONSE_TIMEOUT_SECONDS=180
+export AUTOGEN_MODEL_DEFAULT=gpt-5.4-xhigh
+
+uv run orchestrator run \
+  --repo-url git@github.com:your-org/your-repo.git \
+  --prd-file /absolute/path/to/prd.md \
+  --thread-id demo-run-rightcodes
+```
+
+For `gpt-5.4-xhigh`, a 45 second timeout is often too small once the developer role starts planning or scaffolding. Prefer `AUTOGEN_OPENAI_RESPONSE_TIMEOUT_SECONDS=180` or higher for long tool loops.
 
 ### Current verification
 
