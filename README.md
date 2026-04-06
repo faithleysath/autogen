@@ -19,11 +19,13 @@ For the current `docker-compose.yml`, the important variables are:
 - `LANGSMITH_PROJECT`: optional project name for traces
 - `LANGSMITH_WORKSPACE_ID`: only needed if your API key belongs to multiple workspaces
 - `OPENAI_API_KEY`: likely needed once the orchestrator starts making model calls
+- `AUTOGEN_WORKSPACE_ROOT`: absolute host path where per-run workspaces are created and shared with the orchestrator
 - `AGENT_SSH_DIR`: optional local directory with SSH material for agent containers
 
 Notes:
 
 - If you want a custom tracing project, set `LANGSMITH_PROJECT`; otherwise LangSmith will use its default tracing project behavior.
+- `AUTOGEN_WORKSPACE_ROOT` should be an absolute host path. The `orchestrator` container bind-mounts it back into itself at the same absolute path so child containers can mount subdirectories without any extra path rewriting.
 
 ## Local SSH For GitHub
 
@@ -55,6 +57,8 @@ The main entrypoint is [docker-compose.yml](/Users/laysath/proj/autogen/docker-c
 These two agent images are now intentionally scoped to Bun-based frontend work. They do not preinstall Python or `uv`; the Python runtime remains isolated to the dedicated [orchestrator](/Users/laysath/proj/autogen/orchestrator) container.
 
 Only the `orchestrator` container gets access to the host Docker socket. `agent-dev` and `agent-e2e` no longer include Docker CLI tooling and cannot control sibling containers directly.
+
+The `orchestrator` service also bind-mounts `AUTOGEN_WORKSPACE_ROOT` at the same absolute path inside the container. This keeps the backing workspace path identical from the host and orchestrator perspectives, while the dynamically created execution containers can still see that same workspace as `/workspace`.
 
 The `manual-agents` profile also no longer bind-mounts the host repository into `/workspace`; these containers are now for image inspection and SSH validation rather than in-place repo editing.
 

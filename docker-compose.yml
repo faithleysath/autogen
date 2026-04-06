@@ -12,8 +12,12 @@ services:
       LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-autogen-local}
       LANGSMITH_WORKSPACE_ID: ${LANGSMITH_WORKSPACE_ID:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      AUTOGEN_WORKSPACE_ROOT: ${AUTOGEN_WORKSPACE_ROOT}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: ${AUTOGEN_WORKSPACE_ROOT}
+        target: ${AUTOGEN_WORKSPACE_ROOT}
 
   agent-dev:
     profiles: ["manual-agents"]
