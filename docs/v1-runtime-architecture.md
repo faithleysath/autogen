@@ -44,6 +44,36 @@
 
 这里建议 `v1` 默认使用独立工作分支，而不是直接往 `main` 提交。这样可以保持自动化，又能明显降低误写主分支的风险。
 
+## 冻结执行合同
+
+`PRD` 在 `v1` 中是原始需求输入，但不直接作为后续所有 agent 的统一判定基线。
+
+原因很现实：
+
+- `PRD` 往往包含产品语言、模糊描述和开放问题
+- 同一段 `PRD` 文本很容易被 `开发`、`规范审查`、`E2E` 三个角色各自解释
+- 如果没有中间层，发布门禁很容易因为“口径不一致”而不是“实现缺陷”失败
+
+因此，`架构师 agent` 的第一职责不是立刻拆阶段，而是先基于 `PRD` 与当前仓库代码冻结一份 `execution-contract.md`。
+
+从 `execution-contract.md` 生成完成开始：
+
+- `开发 agent` 按合同实现，不再自行自由解释 `PRD`
+- `规范符合度审查` 对照合同判断“是否做了、是否做全了、是否与约束一致”
+- `E2E 验收` 根据合同和 `e2e-plan.md` 覆盖关键验收场景
+- 如果发布失败并回流重规划，则进入新的 `cycle-<n>`，生成新的合同版本；旧合同继续保留用于审计
+
+`execution-contract.md` 建议至少包含：
+
+- 交付范围与非目标
+- 页面 / 路由 / API / 数据持久化等显式交付项
+- 关键交互与边界条件
+- 可验证的验收标准
+- 外部依赖、技术约束和兼容性要求
+- 因 `PRD` 歧义而采用的显式假设
+
+如果 `PRD` 存在模糊点，必须先在合同里收敛为明确假设或约束，后续 agent 不能各自二次解释。
+
 ---
 
 ## 预制容器
@@ -125,6 +155,7 @@
     run.json
   10-planning/
     cycle-001/
+      execution-contract.md
       architecture-plan.md
       e2e-plan.md
   20-stages/
@@ -150,6 +181,13 @@
 ```
 
 普通业务代码仍然留在仓库原本的源代码目录里；`.autogen/runs/<run_id>/` 只承载流程控制工件和审计记录。
+
+其中：
+
+- `prd.md` 保存原始输入，方便审计和回放
+- `execution-contract.md` 保存冻结后的统一需求口径
+- `architecture-plan.md` 保存阶段拆分、实施顺序和回环策略
+- `e2e-plan.md` 保存端到端场景设计与覆盖边界
 
 ### 三重循环与文件归属
 
@@ -207,11 +245,14 @@
 - 在容器中克隆 `run_branch`
 - 把 `PRD` 与当前仓库代码一起作为输入
 - 把 `PRD` 落盘到 `.autogen/runs/<run_id>/00-input/prd.md`
-- 输出规划文件到 `.autogen/runs/<run_id>/10-planning/cycle-<n>/`
+- 先输出冻结的 `execution-contract.md` 到 `.autogen/runs/<run_id>/10-planning/cycle-<n>/`
+- 再输出 `architecture-plan.md` 与 `e2e-plan.md` 到 `.autogen/runs/<run_id>/10-planning/cycle-<n>/`
 - 提交并推送这次规划产生的工件
 - 结束后该容器可以直接销毁
 
 `架构师 agent` 不需要长时间持有容器状态，因为它的核心产物已经直接写进仓库并提交到了远端分支。
+
+这里最关键的是：后续开发、规范审查、E2E 验收都应读取同一个 `execution-contract.md`，而不是各自重新解释 `prd.md`。
 
 ### 阶段内双 agent 模式
 
@@ -292,6 +333,12 @@
 
 这样可以确保验证结果针对的是“已提交的候选版本”，而不是某个开发容器里的未提交状态。
 
+同时三路验证都应显式读取同一个 `execution-contract.md`：
+
+- `规范符合度审查` 用它判断需求覆盖与约束符合度
+- `工程 QA` 用它辅助判断测试缺口是否影响合同承诺
+- `E2E 验收` 用它和 `e2e-plan.md` 共同确定必测场景
+
 ### 发布门禁失败
 
 如果发布门禁判定需要返工：
@@ -316,7 +363,7 @@
 flowchart TD
     U["输入: PRD + GitHub repo"] --> I["初始化运行<br/>解析默认分支并创建 run branch"]
     I --> A["架构师 agent<br/>新开发容器 + clone repo"]
-    A --> P["开发方案.md"]
+    A --> P["execution-contract.md + architecture-plan.md + e2e-plan.md"]
     P --> D["开发 agent<br/>共享阶段容器中的实现身份"]
     D --> SG["阶段门禁 agent<br/>共享同一开发容器"]
     SG --> SGD{"阶段结果"}
@@ -352,6 +399,7 @@ flowchart TD
 - `head_sha`
 - `artifact_root_path`
 - `planning_cycle`
+- `execution_contract_path`
 - `plan_path`
 - `e2e_plan_path`
 - `stages`
