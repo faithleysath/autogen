@@ -213,6 +213,24 @@ class GitService:
             args=["status", "--short"],
         )
 
+    async def changed_paths(self, *, container_id: str, workspace: WorkspaceView) -> list[str]:
+        result = await self._docker.exec(
+            container_id=container_id,
+            cmd=["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd="/workspace",
+            timeout_seconds=self._config.cmd_timeout_seconds,
+        )
+        result.raise_for_error("git status --porcelain=v1 --untracked-files=all")
+        paths: list[str] = []
+        for line in result.stdout.splitlines():
+            if len(line) < 4:
+                continue
+            path = line[3:]
+            if " -> " in path:
+                _, path = path.split(" -> ", 1)
+            paths.append(path)
+        return paths
+
     async def diff(self, *, container_id: str, workspace: WorkspaceView) -> str:
         return await self.run_git(
             container_id=container_id,
@@ -319,4 +337,33 @@ class GitService:
             logger.info(
                 "git_push",
                 extra={"workspace_id": workspace.workspace_id, "run_branch": run_branch, "set_upstream": set_upstream},
+            )
+
+    async def best_effort_revert_paths(
+        self,
+        *,
+        container_id: str,
+        workspace: WorkspaceView,
+        paths: list[str],
+    ) -> None:
+        if not paths:
+            return
+        commands = (
+            ["git", "restore", "--source=HEAD", "--staged", "--worktree", "--", *paths],
+            ["git", "clean", "-fd", "--", *paths],
+        )
+        for cmd in commands:
+            result = await self._docker.exec(
+                container_id=container_id,
+                cmd=cmd,
+                cwd="/workspace",
+                timeout_seconds=self._config.cmd_timeout_seconds,
+            )
+            logger.info(
+                "git_best_effort_revert",
+                extra={
+                    "workspace_id": workspace.workspace_id,
+                    "cmd": cmd,
+                    "exit_code": result.exit_code,
+                },
             )

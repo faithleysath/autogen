@@ -26,6 +26,29 @@ PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 logger = logging.getLogger(__name__)
 
 
+def _require_path(actual_path: str, expected_path: str, *, label: str) -> None:
+    if actual_path != expected_path:
+        raise RuntimeError(f"{label} path mismatch: expected {expected_path}, got {actual_path}")
+
+
+def _require_frontmatter_fields(meta: dict[str, Any], *, path: str, fields: list[str]) -> None:
+    missing = [field for field in fields if field not in meta]
+    if missing:
+        raise RuntimeError(f"{path} is missing required frontmatter fields: {', '.join(missing)}")
+
+
+def _require_frontmatter_value(
+    meta: dict[str, Any],
+    *,
+    path: str,
+    field: str,
+    expected: Any,
+) -> None:
+    actual = meta.get(field)
+    if actual != expected:
+        raise RuntimeError(f"{path} frontmatter field {field!r} expected {expected!r}, got {actual!r}")
+
+
 class RoleRunnerProtocol(Protocol):
     async def run_architect(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]: ...
 
@@ -152,9 +175,14 @@ class OpenAIRoleRunner:
             policy=policy,
         )
         specs: list[ToolSpec] = []
-        specs.extend(FileToolset(context).specs())
+        specs.extend(
+            FileToolset(
+                context,
+                include_write_tools=role in {"architect", "developer"},
+            ).specs()
+        )
         specs.extend(ArtifactToolset(context, self._artifact_service).specs())
-        specs.extend(BashToolset(context, self._docker, self._config).specs())
+        specs.extend(BashToolset(context, self._docker, self._git, self._config).specs())
         specs.extend(GitReadToolset(context, self._git).specs())
         specs.append(self._make_submit_tool(result_schema))
         return {spec.name: spec for spec in specs}
@@ -285,6 +313,9 @@ class OpenAIRoleRunner:
         cycle_no = state["cycle_no"]
         run_id = state["run_id"]
         planning_root = f"/workspace/.autogen/runs/{run_id}/10-planning/cycle-{cycle_no:03d}"
+        expected_execution_contract_path = f"{planning_root}/execution-contract.md"
+        expected_plan_path = f"{planning_root}/architecture-plan.md"
+        expected_e2e_plan_path = f"{planning_root}/e2e-plan.md"
         user_prompt = json.dumps(
             {
                 "run_id": run_id,
@@ -294,9 +325,9 @@ class OpenAIRoleRunner:
                 "previous_execution_contract_path": state.get("execution_contract_path"),
                 "previous_rework_summary_path": state.get("rework_summary_path"),
                 "required_outputs": {
-                    "execution_contract_path": f"{planning_root}/execution-contract.md",
-                    "plan_path": f"{planning_root}/architecture-plan.md",
-                    "e2e_plan_path": f"{planning_root}/e2e-plan.md",
+                    "execution_contract_path": expected_execution_contract_path,
+                    "plan_path": expected_plan_path,
+                    "e2e_plan_path": expected_e2e_plan_path,
                 },
                 "artifact_requirements": {
                     "execution_contract_kind": "execution_contract",
@@ -326,7 +357,7 @@ class OpenAIRoleRunner:
             "required": ["execution_contract_path", "plan_path", "e2e_plan_path", "summary"],
             "additionalProperties": False,
         }
-        return await self._run_role(
+        result = await self._run_role(
             role="architect",
             model=self._config.model_for_role("architect"),
             user_prompt=user_prompt,
@@ -335,6 +366,53 @@ class OpenAIRoleRunner:
             container_id=container_id,
             result_schema=schema,
         )
+        _require_path(
+            result["execution_contract_path"],
+            expected_execution_contract_path,
+            label="execution contract",
+        )
+        _require_path(result["plan_path"], expected_plan_path, label="architecture plan")
+        _require_path(result["e2e_plan_path"], expected_e2e_plan_path, label="e2e plan")
+
+        execution_contract = self._artifact_service.read_artifact(workspace, result["execution_contract_path"])
+        _require_frontmatter_fields(
+            execution_contract.meta,
+            path=result["execution_contract_path"],
+            fields=["kind", "run_id", "role", "created_at"],
+        )
+        _require_frontmatter_value(
+            execution_contract.meta,
+            path=result["execution_contract_path"],
+            field="run_id",
+            expected=run_id,
+        )
+
+        plan_doc = self._artifact_service.read_artifact(workspace, result["plan_path"])
+        _require_frontmatter_fields(
+            plan_doc.meta,
+            path=result["plan_path"],
+            fields=["kind", "run_id", "role", "created_at", "stage_count", "stages"],
+        )
+        _require_frontmatter_value(
+            plan_doc.meta,
+            path=result["plan_path"],
+            field="run_id",
+            expected=run_id,
+        )
+
+        e2e_plan = self._artifact_service.read_artifact(workspace, result["e2e_plan_path"])
+        _require_frontmatter_fields(
+            e2e_plan.meta,
+            path=result["e2e_plan_path"],
+            fields=["kind", "run_id", "role", "created_at", "scenario_count", "scenarios"],
+        )
+        _require_frontmatter_value(
+            e2e_plan.meta,
+            path=result["e2e_plan_path"],
+            field="run_id",
+            expected=run_id,
+        )
+        return result
 
     async def run_developer(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
         stage_plan = state["current_stage_plan"]
@@ -412,7 +490,7 @@ class OpenAIRoleRunner:
             "required": ["decision", "gate_path", "summary"],
             "additionalProperties": False,
         }
-        return await self._run_role(
+        result = await self._run_role(
             role="stage_gate",
             model=self._config.model_for_role("stage_gate"),
             user_prompt=user_prompt,
@@ -421,6 +499,32 @@ class OpenAIRoleRunner:
             container_id=container_id,
             result_schema=schema,
         )
+        _require_path(result["gate_path"], gate_path, label="stage gate artifact")
+        artifact = self._artifact_service.read_artifact(workspace, result["gate_path"])
+        _require_frontmatter_fields(
+            artifact.meta,
+            path=result["gate_path"],
+            fields=["kind", "run_id", "cycle", "stage", "attempt", "role", "created_at", "decision", "status"],
+        )
+        _require_frontmatter_value(
+            artifact.meta,
+            path=result["gate_path"],
+            field="run_id",
+            expected=state["run_id"],
+        )
+        _require_frontmatter_value(
+            artifact.meta,
+            path=result["gate_path"],
+            field="role",
+            expected="stage_gate",
+        )
+        _require_frontmatter_value(
+            artifact.meta,
+            path=result["gate_path"],
+            field="decision",
+            expected=result["decision"],
+        )
+        return result
 
     async def run_compliance(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
         return await self._run_review_role(
@@ -479,7 +583,7 @@ class OpenAIRoleRunner:
             "required": ["report_path", "verdict", "summary"],
             "additionalProperties": False,
         }
-        return await self._run_role(
+        result = await self._run_role(
             role=role,
             model=self._config.model_for_role(role),
             user_prompt=user_prompt,
@@ -488,6 +592,39 @@ class OpenAIRoleRunner:
             container_id=container_id,
             result_schema=schema,
         )
+        _require_path(result["report_path"], report_path, label=f"{role} report")
+        artifact = self._artifact_service.read_artifact(workspace, result["report_path"])
+        _require_frontmatter_fields(
+            artifact.meta,
+            path=result["report_path"],
+            fields=["kind", "run_id", "release", "role", "candidate_code_sha", "status", "verdict"],
+        )
+        _require_frontmatter_value(
+            artifact.meta,
+            path=result["report_path"],
+            field="run_id",
+            expected=state["run_id"],
+        )
+        _require_frontmatter_value(
+            artifact.meta,
+            path=result["report_path"],
+            field="role",
+            expected=role,
+        )
+        _require_frontmatter_value(
+            artifact.meta,
+            path=result["report_path"],
+            field="candidate_code_sha",
+            expected=state["candidate_code_sha"],
+        )
+        _require_frontmatter_value(
+            artifact.meta,
+            path=result["report_path"],
+            field="verdict",
+            expected=result["verdict"],
+        )
+        result["candidate_code_sha"] = artifact.meta["candidate_code_sha"]
+        return result
 
     async def run_release_gate(
         self,
@@ -523,7 +660,7 @@ class OpenAIRoleRunner:
             "required": ["decision", "decision_path", "rework_summary_path", "summary"],
             "additionalProperties": False,
         }
-        return await self._run_role(
+        result = await self._run_role(
             role="release_gate",
             model=self._config.model_for_role("release_gate"),
             user_prompt=user_prompt,
@@ -532,3 +669,54 @@ class OpenAIRoleRunner:
             container_id=container_id,
             result_schema=schema,
         )
+        decision_path = f"/workspace/.autogen/runs/{state['run_id']}/40-release/release-{release_no:03d}/decision.md"
+        rework_path = f"/workspace/.autogen/runs/{state['run_id']}/50-rework/release-{release_no:03d}/rework-summary.md"
+        _require_path(result["decision_path"], decision_path, label="release decision")
+        decision_artifact = self._artifact_service.read_artifact(workspace, result["decision_path"])
+        _require_frontmatter_fields(
+            decision_artifact.meta,
+            path=result["decision_path"],
+            fields=["kind", "run_id", "release", "role", "created_at", "decision"],
+        )
+        _require_frontmatter_value(
+            decision_artifact.meta,
+            path=result["decision_path"],
+            field="run_id",
+            expected=state["run_id"],
+        )
+        _require_frontmatter_value(
+            decision_artifact.meta,
+            path=result["decision_path"],
+            field="role",
+            expected="release_gate",
+        )
+        _require_frontmatter_value(
+            decision_artifact.meta,
+            path=result["decision_path"],
+            field="decision",
+            expected=result["decision"],
+        )
+
+        if result["decision"] == "REWORK":
+            _require_path(result["rework_summary_path"], rework_path, label="rework summary")
+            rework_artifact = self._artifact_service.read_artifact(workspace, result["rework_summary_path"])
+            _require_frontmatter_fields(
+                rework_artifact.meta,
+                path=result["rework_summary_path"],
+                fields=["kind", "run_id", "release", "role", "created_at"],
+            )
+            _require_frontmatter_value(
+                rework_artifact.meta,
+                path=result["rework_summary_path"],
+                field="run_id",
+                expected=state["run_id"],
+            )
+            _require_frontmatter_value(
+                rework_artifact.meta,
+                path=result["rework_summary_path"],
+                field="role",
+                expected="release_gate",
+            )
+        elif result["rework_summary_path"]:
+            raise RuntimeError("release_gate returned rework_summary_path for a PASS decision")
+        return result

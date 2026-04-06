@@ -28,3 +28,18 @@ def test_workspace_rejects_escape(tmp_path):
     )
     with pytest.raises(ValueError):
         workspace.to_backing_path("/tmp/outside.txt")
+
+
+def test_workspace_rejects_symlink_escape(tmp_path):
+    workspace = WorkspaceView(
+        workspace_id="ws",
+        visible_root=VISIBLE_ROOT,
+        backing_root=tmp_path,
+        run_id="run-1",
+        workspace_kind="stage-dev",
+    )
+    outside = tmp_path.parent / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    (tmp_path / "linked.txt").symlink_to(outside)
+    with pytest.raises(ValueError):
+        workspace.to_backing_path("/workspace/linked.txt")

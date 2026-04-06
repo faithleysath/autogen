@@ -23,13 +23,13 @@ class ArtifactService:
         body = body.rstrip() + "\n"
         return f"---\n{frontmatter}\n---\n\n{body}"
 
-    def parse_markdown_frontmatter(self, path: Path, content: str) -> ArtifactDocument:
+    def parse_markdown_frontmatter(self, path_display: str, content: str) -> ArtifactDocument:
         match = FRONTMATTER_PATTERN.match(content)
         if not match:
-            raise ValueError(f"missing YAML frontmatter: {path}")
+            raise ValueError(f"missing YAML frontmatter: {path_display}")
         meta_raw, body = match.groups()
         meta = yaml.safe_load(meta_raw) or {}
-        return ArtifactDocument(path=path, meta=meta, body=body.lstrip("\n"))
+        return ArtifactDocument(path=Path(path_display), meta=meta, body=body.lstrip("\n"))
 
     def write_artifact(
         self,
@@ -61,7 +61,7 @@ class ArtifactService:
             extra={"workspace_id": workspace.workspace_id, "path": visible_path},
         )
         return self.parse_markdown_frontmatter(
-            backing_path,
+            visible_path,
             backing_path.read_text(encoding="utf-8"),
         )
 

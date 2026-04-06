@@ -5,14 +5,14 @@ import asyncio
 import json
 import logging
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 
 from orchestrator.app import OrchestratorApp, build_app
 from orchestrator.graph.builder import build_graph
+from orchestrator.graph.nodes.common import now_utc
 from orchestrator.logging_utils import setup_logging
 from orchestrator.models.state import make_initial_state
-from orchestrator.observability import trace, traced_block, tracing_context_for_run
+from orchestrator.observability import traced_block, tracing_context_for_run
 
 logger = logging.getLogger(__name__)
 
@@ -38,31 +38,54 @@ async def _run(args: argparse.Namespace, app: OrchestratorApp) -> int:
         repo_url=args.repo_url,
     )
     with tracing_cm:
-        async with traced_block(
-            enabled=app.langsmith_client is not None,
-            name="orchestrator.run",
-            run_type="chain",
-            inputs={
-                "repo_url": args.repo_url,
-                "thread_id": args.thread_id,
-                "prd_char_count": len(prd_markdown),
-            },
-            metadata={
-                "command": "run",
-                "thread_id": args.thread_id,
-            },
-            tags=["autogen", "orchestrator", "run"],
-            client=app.langsmith_client,
-        ) as root_trace:
-            result = await graph.ainvoke(initial_state, config=config)
-            if root_trace is not None:
-                root_trace.end(
-                    outputs={
-                        "run_id": result.get("run_id"),
-                        "run_status": result.get("run_status"),
-                        "release_decision": result.get("release_decision"),
-                    }
+        try:
+            async with traced_block(
+                enabled=app.langsmith_client is not None,
+                name="orchestrator.run",
+                run_type="chain",
+                inputs={
+                    "repo_url": args.repo_url,
+                    "thread_id": args.thread_id,
+                    "prd_char_count": len(prd_markdown),
+                },
+                metadata={
+                    "command": "run",
+                    "thread_id": args.thread_id,
+                },
+                tags=["autogen", "orchestrator", "run"],
+                client=app.langsmith_client,
+            ) as root_trace:
+                result = await graph.ainvoke(initial_state, config=config)
+                if root_trace is not None:
+                    root_trace.end(
+                        outputs={
+                            "run_id": result.get("run_id"),
+                            "run_status": result.get("run_status"),
+                            "release_decision": result.get("release_decision"),
+                        }
+                    )
+        except Exception as exc:
+            failure_state = await _handle_run_failure(
+                graph=graph,
+                app=app,
+                config=config,
+                error=exc,
+            )
+            logger.exception("run_failed", extra={"repo_url": args.repo_url, "thread_id": args.thread_id})
+            print(
+                json.dumps(
+                    {
+                        "thread_id": args.thread_id,
+                        "run_id": failure_state.get("run_id"),
+                        "run_branch": failure_state.get("run_branch"),
+                        "run_status": "FAILED",
+                        "error": str(exc),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
                 )
+            )
+            return 1
     logger.info(
         "run_completed",
         extra={
@@ -87,6 +110,51 @@ async def _run(args: argparse.Namespace, app: OrchestratorApp) -> int:
         )
     )
     return 0
+
+
+async def _handle_run_failure(
+    *,
+    graph,
+    app: OrchestratorApp,
+    config: dict[str, object],
+    error: Exception,
+) -> dict[str, object]:
+    try:
+        snapshot = await graph.aget_state(config)
+        state = dict(snapshot.values or {})
+    except Exception:
+        logger.exception("failed_to_read_state_after_run_error")
+        return {}
+
+    for container_id in dict(state.get("active_containers", {})).values():
+        try:
+            await app.docker_manager.remove_container(container_id)
+        except Exception:
+            logger.exception("failed_to_remove_container_after_run_error", extra={"container_id": container_id})
+
+    updates = {
+        "active_containers": {},
+        "run_status": "FAILED",
+        "last_error": {
+            "type": type(error).__name__,
+            "message": str(error),
+            "at": now_utc(),
+        },
+        "event_log": [
+            {
+                "event": "end_failure",
+                "error_type": type(error).__name__,
+                "at": now_utc(),
+            }
+        ],
+    }
+    try:
+        await graph.aupdate_state(config, updates, as_node="end_failure")
+    except Exception:
+        logger.exception("failed_to_persist_failure_state")
+
+    state.update(updates)
+    return state
 
 
 def _draw_graph_ascii(args: argparse.Namespace, app: OrchestratorApp) -> int:

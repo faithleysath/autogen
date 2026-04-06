@@ -16,11 +16,12 @@ def _line_slice(content: str, start_line: int | None, end_line: int | None) -> s
 
 
 class FileToolset:
-    def __init__(self, context: ToolContext) -> None:
+    def __init__(self, context: ToolContext, *, include_write_tools: bool = True) -> None:
         self._context = context
+        self._include_write_tools = include_write_tools
 
     def specs(self) -> list[ToolSpec]:
-        return [
+        specs = [
             ToolSpec(
                 name="list_files",
                 description="List files under a workspace path. Use this to explore the repository tree.",
@@ -65,37 +66,43 @@ class FileToolset:
                 },
                 handler=self.search_text,
             ),
-            ToolSpec(
-                name="write_file",
-                description="Write a UTF-8 text file to an allowed workspace path, creating parent directories when needed.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": False,
-                },
-                handler=self.write_file,
-            ),
-            ToolSpec(
-                name="replace_in_file",
-                description="Replace text within an allowed workspace file. Use after reading the current file content.",
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "old": {"type": "string"},
-                        "new": {"type": "string"},
-                        "replace_all": {"type": "boolean"},
-                    },
-                    "required": ["path", "old", "new", "replace_all"],
-                    "additionalProperties": False,
-                },
-                handler=self.replace_in_file,
-            ),
         ]
+        if self._include_write_tools:
+            specs.extend(
+                [
+                    ToolSpec(
+                        name="write_file",
+                        description="Write a UTF-8 text file to an allowed workspace path, creating parent directories when needed.",
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                            "required": ["path", "content"],
+                            "additionalProperties": False,
+                        },
+                        handler=self.write_file,
+                    ),
+                    ToolSpec(
+                        name="replace_in_file",
+                        description="Replace text within an allowed workspace file. Use after reading the current file content.",
+                        parameters={
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "old": {"type": "string"},
+                                "new": {"type": "string"},
+                                "replace_all": {"type": "boolean"},
+                            },
+                            "required": ["path", "old", "new", "replace_all"],
+                            "additionalProperties": False,
+                        },
+                        handler=self.replace_in_file,
+                    ),
+                ]
+            )
+        return specs
 
     async def list_files(self, args: dict[str, Any]) -> dict[str, Any]:
         visible_path = args["path"]

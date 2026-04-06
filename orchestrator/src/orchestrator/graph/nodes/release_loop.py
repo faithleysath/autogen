@@ -136,7 +136,7 @@ async def _run_review_role(role: str, state: OrchestrationState, app: Orchestrat
         "review_results": {
             role: {
                 "workspace_id": state["active_workspaces"][role],
-                "candidate_code_sha": state["candidate_code_sha"],
+                "candidate_code_sha": result["candidate_code_sha"],
                 "report_path": result["report_path"],
                 "verdict": result["verdict"],
                 "published_commit_sha": None,
@@ -151,6 +151,17 @@ async def join_review_results(state: OrchestrationState, app: OrchestratorApp) -
     missing = {"compliance", "qa", "e2e"} - set(state["review_results"])
     if missing:
         raise RuntimeError(f"missing review results: {sorted(missing)}")
+    candidate_shas = {
+        role: data.get("candidate_code_sha")
+        for role, data in state["review_results"].items()
+    }
+    unique_candidate_shas = {sha for sha in candidate_shas.values() if sha}
+    if len(unique_candidate_shas) != 1:
+        raise RuntimeError(f"review reports disagree on candidate_code_sha: {candidate_shas}")
+    if state.get("candidate_code_sha") not in unique_candidate_shas:
+        raise RuntimeError(
+            "review report candidate_code_sha does not match the frozen release candidate"
+        )
     return {
         "event_log": [{"event": "join_review_results", "at": now_utc()}],
     }
@@ -276,6 +287,12 @@ async def reset_for_replan(state: OrchestrationState, app: OrchestratorApp) -> d
         "stage_index": 0,
         "attempt_no": 0,
         "stage_no": 0,
+        "current_stage_gate_path": None,
+        "current_gate_decision": None,
+        "candidate_code_sha": None,
+        "review_results": {},
+        "release_decision": None,
+        "release_decision_path": None,
         "active_workspaces": active_workspaces,
         "active_containers": active_containers,
         "run_status": "REWORK",

@@ -52,6 +52,8 @@ async def prepare_stage_workspace(state: OrchestrationState, app: OrchestratorAp
         "stage_no": stage_no,
         "attempt_no": 0,
         "current_stage_plan": stage_plan,
+        "current_stage_gate_path": None,
+        "current_gate_decision": None,
         "active_workspaces": active_workspaces,
         "active_containers": active_containers,
         "run_status": "DEVELOPING",

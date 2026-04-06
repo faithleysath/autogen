@@ -35,7 +35,12 @@ class WorkspaceView:
     def to_backing_path(self, visible_path: str) -> Path:
         normalized = self.ensure_within_workspace(visible_path)
         relative = normalized.relative_to(self.visible_root)
-        return (self.backing_root / relative.as_posix()).resolve()
+        resolved = (self.backing_root / relative.as_posix()).resolve()
+        try:
+            resolved.relative_to(self.backing_root.resolve())
+        except ValueError as exc:
+            raise ValueError(f"path resolves outside workspace: {visible_path}") from exc
+        return resolved
 
     def to_visible_path(self, backing_path: Path) -> str:
         resolved = backing_path.resolve()
