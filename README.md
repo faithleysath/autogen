@@ -20,7 +20,6 @@ For the current `docker-compose.yml`, the important variables are:
 
 Notes:
 
-- For hosted LangSmith, the default service endpoint is usually enough, so `LANGSMITH_ENDPOINT` can stay empty.
 - If you want a custom tracing project, set `LANGSMITH_PROJECT`; otherwise LangSmith will use its default tracing project behavior.
 
 ## Compose
