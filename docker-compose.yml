@@ -14,3 +14,34 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+
+  agent-dev:
+    profiles: ["manual-agents"]
+    build:
+      context: .
+      dockerfile: docker/agents/dev.Dockerfile
+    image: autogen-agent-dev
+    environment:
+      SSH_SOURCE_DIR: /run/host-ssh
+    volumes:
+      - ${AGENT_SSH_DIR:-./.secrets/ssh}:/run/host-ssh:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command: ["sleep", "infinity"]
+
+  agent-e2e:
+    profiles: ["manual-agents"]
+    build:
+      context: .
+      dockerfile: docker/agents/e2e.Dockerfile
+    image: autogen-agent-e2e
+    environment:
+      SSH_SOURCE_DIR: /run/host-ssh
+    volumes:
+      - ${AGENT_SSH_DIR:-./.secrets/ssh}:/run/host-ssh:ro
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    ipc: host
+    command: ["sleep", "infinity"]
