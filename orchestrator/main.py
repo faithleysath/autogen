@@ -1,5 +1,5 @@
 def main():
-    print("Hello from autogen!")
+    print("Hello from orchestrator!")
 
 
 if __name__ == "__main__":
