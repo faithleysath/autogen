@@ -41,6 +41,7 @@ class ArtifactToolset:
                     "additionalProperties": False,
                 },
                 handler=self.read_markdown_artifact,
+                read_only=True,
             ),
         ]
 

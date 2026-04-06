@@ -8,25 +8,25 @@
 - 不再单独设置 `PRD 专员`
 - 所有执行型 agent 都在 `Docker` 容器中运行；同一开发阶段内，`开发 agent` 与 `阶段门禁 agent` 共享同一个开发容器
 - 代码仓库以 `GitHub` 远端为单一事实来源
-- 阶段门禁本身也是一个 agent；它共享开发容器，但不允许修改代码，且只有它能在通过时提交并推送远端
+- 阶段门禁本身也是一个 agent；它共享开发容器，但不允许修改代码；实际的提交与推送由 `orchestrator` 根据它的结论执行
 - 发布门禁失败后，不复用旧容器和旧 agent 上下文，而是重新规划并重新执行
 
 ---
 
 ## 框架选择
 
-`v1` 推荐采用两层架构：
+`v1` 当前实现采用两层架构：
 
 - 顶层编排使用 `LangGraph`
-- 具体干活的角色 agent 使用 `Deep Agents`
+- 具体干活的角色 agent 使用运行在 `orchestrator` 进程内的 OpenAI Responses API role runner
 
 原因很直接：
 
-- 你的核心难点是多阶段状态流转、门禁判断、失败回环、上下文重置
-- 这些都属于显式工作流和持久化状态管理，更适合放在 `LangGraph`
-- `架构师 agent`、`开发 agent`、`阶段门禁 agent`、后续可能扩展的 `QA agent` 都适合放在 `Deep Agents`
+- 多阶段状态流转、门禁判断、失败回环、上下文重置，属于显式工作流和持久化状态管理，更适合放在 `LangGraph`
+- 角色执行需要访问受限工具、共享 workspace、`docker exec` 和 git 服务，这些都更适合由 `orchestrator` 统一代理
+- 当前实现已经把角色执行固定为“system prompt + restricted tools + structured result”的模式，而不是在执行容器里再跑一层独立 agent runtime
 
-换句话说，`LangGraph` 负责“流程和状态”，`Deep Agents` 负责“进入容器以后如何完成工作”。
+换句话说，`LangGraph` 负责“流程和状态”，role runner 负责“进入容器以后如何完成工作”。
 
 ---
 
@@ -120,15 +120,16 @@
 `v1` 的 git 规则建议固定如下：
 
 - 每次运行先从远端默认分支拉起一条 `run_branch`
-- 所有工作容器都从同一条 `run_branch` 克隆代码
+- 规划工作区和阶段工作区都从 `run_branch` 克隆代码
 - 所有运行输入、规划文档、门禁结论、测试报告、返工建议都必须落在仓库内，并由 git 跟踪
-- `架构师 agent` 只能写规划类工件，并且需要把这些工件提交到 `run_branch`
+- `架构师 agent` 只负责生成规划类工件；实际提交与推送由 `orchestrator` 的 git service 完成
 - `开发 agent` 与 `阶段门禁 agent` 在同一阶段共享同一个开发容器和同一个工作区
 - `阶段门禁 agent` 可以读取代码、运行命令、执行测试、检查 diff，并承担审查与放行职责
 - `阶段门禁 agent` 不允许修改源代码和业务文件，但允许写入自己负责的阶段门禁工件
-- `开发 agent` 负责改代码，`阶段门禁 agent` 负责提交当前阶段代码与门禁工件
-- 三路验证 agent 只允许写各自独占的报告路径，并各自提交
-- `发布门禁` 不直接重写历史，只决定“交付成功”还是“回流重做”
+- `开发 agent` 负责改代码，`阶段门禁 agent` 负责给出阶段结论；`orchestrator` 根据结论决定只提交门禁工件，还是连同当前阶段代码一起提交
+- 发布阶段先冻结一个 `candidate_code_sha`；三路验证工作区都基于这个固定快照执行，而不是继续直接跟踪 `run_branch`
+- 三路验证 agent 只允许写各自独占的报告路径；报告的串行发布由单独的 publisher workspace 完成
+- `发布门禁` 在 publisher workspace 中读取已发布报告，写发布结论；实际提交与推送仍由 `orchestrator` 完成
 
 这样做有两个好处：
 
@@ -214,23 +215,27 @@
 
 ### git 提交规则
 
-- `架构师 agent` 生成规划工件后，直接提交并推送
-- `阶段门禁 agent` 每次给出阶段结论时，都提交对应的 `gate-decision.md`
-- 如果阶段通过，`阶段门禁 agent` 在同一次提交里一并提交当前阶段代码改动
-- 三路验证 agent 各自提交自己的报告文件，不改别人的报告路径
-- `发布门禁` 在收齐三路报告后，提交发布结论；如果失败，再把返工建议一并提交
+- `架构师 agent` 生成规划工件后，`orchestrator` 在 planning workspace 提交并推送
+- `阶段门禁 agent` 每次给出阶段结论时，都先写对应的 `gate-decision.md`
+- 如果阶段结论是 `FAIL`，`orchestrator` 只提交这次 `gate-decision.md`
+- 如果阶段结论是 `NEXT_STAGE` 或 `COMPLETE_ALL_STAGES`，`orchestrator` 在同一次提交里一并提交当前阶段代码改动和门禁工件
+- 三路验证 agent 各自只生成自己的报告文件，不直接对 `run_branch` 做 push
+- publisher workspace 串行吸收三份报告并推送；`发布门禁` 再在 publisher workspace 中写 `decision.md` 与可选的 `rework-summary.md`
 
-### 三路并发的 pull / push 规则
+### 三路并发的发布规则
 
-三路验证虽然并发执行，但提交时必须串行吸收远端最新状态。推荐固定流程：
+三路验证虽然并发执行，但真正接触 `run_branch` 的发布动作必须串行，并且由 publisher workspace 收口。推荐固定流程：
 
-1. agent 只生成自己负责路径下的报告文件
-2. 提交前执行 `git pull --rebase --autostash origin <run_branch>`
-3. 只 `git add` 自己负责的报告路径
-4. `git commit`
-5. `git push origin <run_branch>`
+1. `orchestrator` 先在 publisher workspace 上记录当前 `candidate_code_sha`
+2. `compliance`、`qa`、`e2e` 三路各自 clone 仓库并 `checkout --detach <candidate_code_sha>`
+3. agent 只生成自己负责路径下的报告文件
+4. `orchestrator` 把报告复制到 publisher workspace 的同一 repo-relative path
+5. publisher workspace 对每一份报告执行 `git pull --rebase --autostash origin <run_branch>`、`git add`、`git commit`、`git push`
 
-因为三路报告的落点是完全分开的，正常情况下只要遵守固定路径规范，`pull --rebase` 不应该产生业务冲突。
+这样可以同时满足两个目标：
+
+- 三路验证始终对齐同一个候选代码快照
+- `run_branch` 上的串行发布责任始终集中在 `orchestrator`
 
 ---
 
@@ -246,7 +251,7 @@
 - 把 `PRD` 落盘到 `.autogen/runs/<run_id>/00-input/prd.md`
 - 先输出冻结的 `execution-contract.md` 到 `.autogen/runs/<run_id>/10-planning/cycle-<n>/`
 - 再输出 `architecture-plan.md` 与 `e2e-plan.md` 到 `.autogen/runs/<run_id>/10-planning/cycle-<n>/`
-- 提交并推送这次规划产生的工件
+- 由 `orchestrator` 提交并推送这次规划产生的工件
 - 结束后该容器可以直接销毁
 
 `架构师 agent` 不需要长时间持有容器状态，因为它的核心产物已经直接写进仓库并提交到了远端分支。
@@ -266,7 +271,7 @@
 - 使用同一个仓库副本
 - 看到同一个工作区状态
 - 共享同一个执行环境
-- 角色和权限不同：`开发 agent` 负责实现，`阶段门禁 agent` 负责审查、放行、提交，但不能改代码
+- 角色和权限不同：`开发 agent` 负责实现，`阶段门禁 agent` 负责审查和放行，但不能改代码；实际提交由 `orchestrator` 统一执行
 
 也就是说，`阶段门禁 agent` 不是容器外的裁判，而是进入同一个开发现场、直接检查同一份工作区的独立身份。
 
@@ -285,14 +290,15 @@
 - 只允许写入 `.autogen/runs/<run_id>/20-stages/.../gate-decision.md`
 - 不允许修改源代码、测试代码或其他业务工件
 - 负责评估当前阶段是否不过关、进入下一阶段、或全部完成
-- 每次得出阶段结论时，都负责提交对应的门禁工件
-- 在判定可以进入下一阶段时，由它负责把门禁工件与当前阶段代码一起提交并推送
+- 每次得出阶段结论时，都负责产出对应的门禁工件
+- `orchestrator` 根据它的结论执行后续 git 操作
 
 如果阶段门禁 agent 认为当前阶段需要修正，它只能输出问题和建议，再交回 `开发 agent` 在同一个共享容器里继续修改。
 
 如果 `阶段门禁` 判定“本阶段不过关”：
 
-- `阶段门禁 agent` 先提交本次 `gate-decision.md`
+- `阶段门禁 agent` 先写本次 `gate-decision.md`
+- `orchestrator` 只提交这份门禁工件
 - 继续复用同一个开发 agent 上下文
 - 继续复用同一个阶段门禁 agent 上下文
 - 继续复用同一个开发容器
@@ -300,7 +306,7 @@
 
 如果 `阶段门禁` 判定“进入下一阶段”：
 
-- `阶段门禁 agent` 负责提交并推送当前阶段结果到远端
+- `orchestrator` 负责提交并推送当前阶段结果到远端
 - 销毁当前开发 agent 上下文
 - 销毁当前阶段门禁 agent 上下文
 - 销毁当前开发容器
@@ -314,13 +320,17 @@
 
 ### 三路验证
 
-在“所有阶段完成”后，启动三路独立验证：
+在“所有阶段完成”后，先冻结候选版本，再启动三路独立验证：
+
+- `orchestrator` 新建 publisher workspace，跟踪 `run_branch`
+- publisher workspace 读取当前 HEAD，记录 `candidate_code_sha`
+- 后续三路验证都基于这个固定候选快照执行
 
 - `规范符合度审查`：新建开发容器
 - `工程 QA`：新建开发容器
 - `E2E 验收`：新建 E2E 容器
 
-三路验证都从远端最新 `run_branch` 重新克隆，不共享开发阶段容器。
+三路验证都重新克隆仓库，但会 `checkout --detach <candidate_code_sha>`，不共享开发阶段容器，也不继续直接跟踪 `run_branch`。
 
 三路验证的输出文件必须固定在下面三个互不重叠的路径：
 
@@ -328,9 +338,12 @@
 - `.autogen/runs/<run_id>/30-reviews/release-<n>/qa/report.md`
 - `.autogen/runs/<run_id>/30-reviews/release-<n>/e2e/report.md`
 
-每一路在提交自己的报告前，都必须先执行 `git pull --rebase --autostash origin <run_branch>`，然后再提交并推送自己的报告文件。
+每一路只负责产出自己的报告文件；随后由 `orchestrator` 把报告复制到 publisher workspace，并由 publisher workspace 串行提交与推送。
 
-这样可以确保验证结果针对的是“已提交的候选版本”，而不是某个开发容器里的未提交状态。
+这样可以确保：
+
+- 验证结果针对的是“已提交的候选版本”，而不是某个开发容器里的未提交状态
+- 三路验证不会因为 `run_branch` 上的报告提交而改变各自的验证基线
 
 同时三路验证都应显式读取同一个 `execution-contract.md`：
 
@@ -344,9 +357,9 @@
 
 - 生成 `40-release/.../decision.md`
 - 生成 `50-rework/.../rework-summary.md`
-- 把这两个文件提交并推送到远端
+- 由 publisher workspace 提交并推送这两个文件到远端
+- 清理前面所有 review workspace、publisher workspace，以及对应容器
 - 清理前面所有 agent 上下文
-- 清理前面所有容器
 - 从远端当前最新提交重新开始
 - 重新调用 `架构师 agent`
 
@@ -368,16 +381,18 @@ flowchart TD
     SG --> SGD{"阶段结果"}
 
     SGD -->|"不过关"| D
-    SGD -->|"进入下一阶段"| C["阶段门禁 agent 提交门禁文件 + 代码并推送远端"]
+    SGD -->|"进入下一阶段"| C["orchestrator 提交门禁文件 + 当前阶段代码"]
     C --> D2["新阶段双 agent<br/>新开发容器 + 新上下文"]
     D2 --> SG
-    SGD -->|"所有阶段完成"| R1["规范符合度审查<br/>新开发容器 + pull/commit/push 报告"]
-    SGD -->|"所有阶段完成"| R2["工程 QA<br/>新开发容器 + pull/commit/push 报告"]
-    SGD -->|"所有阶段完成"| R3["E2E 验收<br/>新 E2E 容器 + pull/commit/push 报告"]
+    SGD -->|"所有阶段完成"| F["publisher workspace<br/>冻结 candidate_code_sha"]
+    F --> R1["规范符合度审查<br/>detached candidate workspace"]
+    F --> R2["工程 QA<br/>detached candidate workspace"]
+    F --> R3["E2E 验收<br/>detached candidate workspace"]
 
-    R1 --> RG{"发布门禁"}
-    R2 --> RG
-    R3 --> RG
+    R1 --> PUB["publisher workspace<br/>串行发布三份报告"]
+    R2 --> PUB
+    R3 --> PUB
+    PUB --> RG{"发布门禁<br/>publisher workspace"}
 
     RG -->|"通过"| O["交付"]
     RG -->|"返工"| RE["返工建议"]
@@ -388,34 +403,37 @@ flowchart TD
 
 ## LangGraph 顶层状态建议
 
-`LangGraph` 顶层 state 建议至少包含这些字段：
+`LangGraph` 顶层 state 当前实现至少包含这些字段：
 
+- `repo_url`
+- `prd_markdown`
 - `run_id`
-- `prd_content`
-- `github_repo_url`
 - `base_branch`
 - `run_branch`
-- `head_sha`
-- `artifact_root_path`
-- `planning_cycle`
+- `run_status`
+- `cycle_no`
+- `next_stage_no`
+- `stage_no`
+- `stage_index`
+- `attempt_no`
+- `release_no`
+- `planned_stages`
+- `current_stage_plan`
+- `candidate_code_sha`
+- `active_workspaces`
+- `active_containers`
 - `execution_contract_path`
 - `plan_path`
 - `e2e_plan_path`
-- `stages`
-- `current_stage_index`
-- `current_stage_attempt`
-- `stage_gate_result`
 - `current_stage_gate_path`
-- `release_cycle`
-- `release_gate_result`
-- `architect_container_id`
-- `developer_container_id`
-- `developer_thread_id`
-- `stage_gate_thread_id`
-- `compliance_report_path`
-- `qa_report_path`
-- `e2e_report_path`
+- `current_gate_decision`
+- `review_results`
+- `release_decision`
+- `release_decision_path`
 - `rework_summary_path`
+- `artifact_root_path`
+- `last_error`
+- `event_log`
 
 这里最重要的不是字段多少，而是把下面几类信息分开存：
 
@@ -428,19 +446,30 @@ flowchart TD
 
 ## 节点职责建议
 
-`v1` 可以先把顶层节点收敛成下面这些：
+`v1` 当前实现的顶层节点收敛成下面这些：
 
 - `initialize_run`
+- `prepare_planning_workspace`
 - `run_architect`
-- `run_developer_for_current_stage`
-- `run_stage_gate_agent`
-- `apply_stage_gate_decision`
+- `publish_planning_artifacts`
+- `load_stage_plan`
+- `prepare_stage_workspace`
+- `run_developer`
+- `run_stage_gate`
+- `publish_stage_gate_result`
+- `freeze_release_candidate`
+- `prepare_review_workspaces`
 - `run_compliance_review`
-- `run_engineering_qa`
-- `run_e2e_validation`
-- `evaluate_release_gate`
-- `prepare_rework_packet`
+- `run_qa_review`
+- `run_e2e_review`
+- `join_review_results`
+- `publish_review_reports`
+- `run_release_gate`
+- `publish_release_decision`
 - `reset_for_replan`
+- `cleanup_run_resources`
+- `end_success`
+- `end_failure`
 
 其中有两个边界要尽量守住：
 
@@ -449,7 +478,7 @@ flowchart TD
 
 不要让 agent 自己决定什么时候重置上下文，也不要让容器内部逻辑直接修改顶层流程状态。
 不要让 `阶段门禁 agent` 直接修代码，否则“审查者”和“实现者”的责任边界会变模糊。
-不要让多个并发验证 agent 写同一个报告文件，否则 `git pull --rebase` 会变成常态冲突源。
+不要让多个并发验证 agent 写同一个报告文件，也不要让 review workspace 直接继续跟踪 `run_branch`，否则候选代码快照会被报告发布过程污染。
 
 ---
 
@@ -487,4 +516,4 @@ flowchart TD
 
 `v1` 的核心原则可以压缩成一句话：
 
-所有控制工件都直接写进仓库并提交；同一阶段内复用共享开发容器，以及绑定其上的开发 agent / 阶段门禁 agent 两个上下文；跨阶段、跨发布回流一律从远端最新提交重新开始。
+所有控制工件都直接写进仓库并提交；同一阶段内复用共享开发容器，以及绑定其上的开发 agent / 阶段门禁 agent 两个上下文；发布阶段先冻结 `candidate_code_sha`，再由 publisher workspace 串行发布报告与结论；跨阶段、跨发布回流一律从远端最新提交重新开始。

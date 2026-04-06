@@ -951,21 +951,17 @@ class RoleRunner(Protocol):
 
 ### 推荐实现
 
-`v1` 推荐：
+`v1` 当前实现：
 
 - 顶层：`LangGraph`
-- 角色执行：`orchestrator` 进程内的 tool-calling agent
+- 角色执行：`orchestrator` 进程内的 OpenAI Responses API tool-calling role runner
 
-实现上可选：
-
-1. 首选：基于 Deep Agents / LangChain tools 的 role runner
-2. 备选：自定义 tool-calling loop
-
-但无论哪种实现，外部行为必须一致：
+实现语义上保持以下约束：
 
 - 角色在 `orchestrator` 内运行
 - 工具由 `orchestrator` 注入
 - 工具背后连接共享 workspace 与 Docker
+- 底层采用自定义 tool-calling loop，而不是在执行容器里再跑独立 agent runtime
 
 ## 11.3 Prompt 管理
 
@@ -2132,10 +2128,8 @@ publisher 集中 push 是 `v1` 的推荐定案。
 
 1. Python 模块具体命名
 2. SQLite 是单文件还是分文件
-3. role runner 底层用 Deep Agents 还是自定义 tool-calling loop
-4. publisher 是否用单独容器，还是复用一个 dev 容器
-5. 容器日志具体落盘格式
-6. frontmatter 的附加字段数量
+3. 容器日志具体落盘格式
+4. frontmatter 的附加字段数量
 
 前提是：
 

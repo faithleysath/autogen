@@ -104,6 +104,7 @@ async def _run(args: argparse.Namespace, app: OrchestratorApp) -> int:
                 "run_status": result.get("run_status"),
                 "release_decision": result.get("release_decision"),
                 "release_decision_path": result.get("release_decision_path"),
+                "usage_summary": result.get("usage_summary"),
             },
             indent=2,
             ensure_ascii=False,

@@ -11,6 +11,7 @@ from orchestrator.graph.nodes.common import (
     visible_relpath,
 )
 from orchestrator.models.state import OrchestrationState
+from orchestrator.models.usage import usage_summary_delta
 
 
 async def freeze_release_candidate(state: OrchestrationState, app: OrchestratorApp) -> dict[str, Any]:
@@ -142,6 +143,7 @@ async def _run_review_role(role: str, state: OrchestrationState, app: Orchestrat
                 "published_commit_sha": None,
             }
         },
+        "usage_summary": usage_summary_delta(role, result.get("usage")),
         "event_log": [{"event": f"run_{role}_review", "verdict": result["verdict"], "at": now_utc()}],
     }
 
@@ -239,6 +241,7 @@ async def run_release_gate(state: OrchestrationState, app: OrchestratorApp) -> d
         "release_decision": result["decision"],
         "release_decision_path": result["decision_path"],
         "rework_summary_path": result["rework_summary_path"] or None,
+        "usage_summary": usage_summary_delta("release_gate", result.get("usage")),
         "event_log": [{"event": "run_release_gate", "decision": result["decision"], "at": now_utc()}],
     }
 

@@ -12,6 +12,7 @@ from orchestrator.graph.nodes.common import (
     visible_relpath,
 )
 from orchestrator.models.state import OrchestrationState
+from orchestrator.models.usage import usage_summary_delta
 
 
 async def prepare_planning_workspace(state: OrchestrationState, app: OrchestratorApp) -> dict[str, Any]:
@@ -69,6 +70,7 @@ async def run_architect(state: OrchestrationState, app: OrchestratorApp) -> dict
         "execution_contract_path": result["execution_contract_path"],
         "plan_path": result["plan_path"],
         "e2e_plan_path": result["e2e_plan_path"],
+        "usage_summary": usage_summary_delta("architect", result.get("usage")),
         "run_status": "PLANNING",
         "event_log": [{"event": "run_architect", "summary": result["summary"], "at": now_utc()}],
     }

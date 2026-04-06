@@ -80,6 +80,7 @@ sequenceDiagram
     participant A as 架构师 agent
     participant D as 开发 agent
     participant G as 阶段门禁 agent
+    participant P as publisher workspace
     participant C as 规范符合度审查
     participant Q as 工程 QA
     participant E as E2E 验收
@@ -98,19 +99,28 @@ sequenceDiagram
     G-->>D: FAIL
     D->>G: 尝试 2
     G->>O: COMPLETE_ALL_STAGES
-    O->>C: release-001 三路验证
-    O->>Q: release-001 三路验证
-    O->>E: release-001 三路验证
-    E->>R: E2E 失败
+    O->>P: freeze release-001 candidate
+    O->>C: release-001 detached review
+    O->>Q: release-001 detached review
+    O->>E: release-001 detached review
+    C->>P: compliance report
+    Q->>P: qa report
+    E->>P: e2e report
+    P->>R: published review reports
     R->>O: REWORK
     O->>A: cycle-002 重规划
     A->>O: 更新 contract / plan / e2e-plan
     O->>D: stage-003 补救开发
     D->>G: 尝试 1
     G->>O: COMPLETE_ALL_STAGES
-    O->>C: release-002 三路验证
-    O->>Q: release-002 三路验证
-    O->>E: release-002 三路验证
+    O->>P: freeze release-002 candidate
+    O->>C: release-002 detached review
+    O->>Q: release-002 detached review
+    O->>E: release-002 detached review
+    C->>P: compliance report
+    Q->>P: qa report
+    E->>P: e2e report
+    P->>R: published review reports
     R->>U: PASS
 ```
 
@@ -180,7 +190,7 @@ sequenceDiagram
 - 刷新页面后恢复筛选条件
 - Playwright 在目标浏览器矩阵中覆盖关键路径
 
-架构师把 `00-input` 和 `cycle-001` 工件提交到 `run_branch`，然后销毁自己的容器。
+架构师写完这些工件后，由 `orchestrator` 在 planning workspace 中把 `00-input` 和 `cycle-001` 工件提交到 `run_branch`，然后销毁规划容器。
 
 从这一刻开始，后续角色主要对齐的是 `execution-contract.md`，而不是重新自由解释 `prd.md`。
 
@@ -228,7 +238,7 @@ FAIL
 - 证据：执行过的检查和失败点
 - 修正建议：补迁移、补测试
 
-然后阶段门禁 agent 只提交这个门禁文件，不提交业务代码。
+然后阶段门禁 agent 只产出这个门禁文件；由 `orchestrator` 只提交这个门禁文件，不提交业务代码。
 
 这一步很关键：
 
@@ -259,7 +269,7 @@ FAIL
 NEXT_STAGE
 ```
 
-然后它做两件事：
+然后 `orchestrator` 做两件事：
 
 1. 把 `attempt-002/gate-decision.md` 加入提交
 2. 把本阶段通过的业务代码改动一起提交并推送到 `run_branch`
@@ -337,7 +347,7 @@ FAIL
 COMPLETE_ALL_STAGES
 ```
 
-然后它把两类内容一起提交并推送：
+然后由 `orchestrator` 把两类内容一起提交并推送：
 
 - `attempt-002/gate-decision.md`
 - 当前阶段所有业务代码改动
@@ -352,12 +362,19 @@ COMPLETE_ALL_STAGES
 
 ### Step 6. `release-001` 的三路验证并发启动
 
-现在系统启动三路独立验证。
+现在系统先冻结候选版本，再启动三路独立验证。
 
-这三路有两个共同规则：
+第一步不是立刻跑 review，而是先创建一个 publisher workspace：
+
+- workspace：`release-001-publisher`
+- clone 分支：远端最新 `run_branch`
+- 记录 `candidate_code_sha = 当前 run_branch HEAD`
+
+随后三路验证再启动。它们有三个共同规则：
 
 - 都不复用刚才的开发容器
-- 都从远端最新 `run_branch` 重新 clone
+- 都重新 clone 仓库
+- 都 `checkout --detach <candidate_code_sha>`，保证验证基线完全一致
 
 同时三路都要显式读取同一个：
 
@@ -410,20 +427,23 @@ COMPLETE_ALL_STAGES
 
 所以这一路结论是失败。
 
-#### 三路验证各自的 Git 规则
+#### 三路验证与发布的 Git 规则
 
-虽然三路是并发跑的，但每一路在提交报告前都必须做同样的事情：
+虽然三路是并发跑的，但 review workspace 本身不直接往 `run_branch` 推报告。当前实现里实际的流程是：
 
-1. `git pull --rebase --autostash origin autogen/run-2026-04-06-090000-demo`
-2. 只 `git add` 自己那一路的报告文件
-3. `git commit`
-4. `git push`
+1. review agent 只生成自己负责的 `report.md`
+2. `orchestrator` 把报告复制到 publisher workspace 的同一路径
+3. publisher workspace 对每份报告执行一次：
+   - `git pull --rebase --autostash origin autogen/run-2026-04-06-090000-demo`
+   - `git add`
+   - `git commit`
+   - `git push`
 
-这样三路验证不会互相覆盖，也不会去碰别人的报告路径。
+这样三路验证不会互相覆盖，同时 `candidate_code_sha` 也不会被报告发布过程污染。
 
 ### Step 7. 第一次发布门禁，走到“返工”
 
-发布门禁读取：
+发布门禁运行在 publisher workspace 中，读取：
 
 - `release-001/compliance/report.md`
 - `release-001/qa/report.md`
@@ -494,7 +514,7 @@ COMPLETE_ALL_STAGES
 
 - `stage-003`：修 hydration 顺序问题，强化恢复逻辑，补跨浏览器 E2E 稳定性
 
-然后架构师提交并推送 `cycle-002`。
+然后由 `orchestrator` 提交并推送 `cycle-002`。
 
 ### Step 9. `stage-003` 补救开发，直接走到“所有阶段完成”
 
@@ -527,7 +547,7 @@ COMPLETE_ALL_STAGES
 COMPLETE_ALL_STAGES
 ```
 
-然后它提交：
+然后由 `orchestrator` 提交：
 
 - 本阶段业务代码
 - 这个门禁文件
@@ -536,7 +556,7 @@ COMPLETE_ALL_STAGES
 
 ### Step 10. `release-002` 的三路验证，全部通过
 
-系统再次启动三路验证，这次输出落在：
+系统再次先冻结 `release-002` 的 `candidate_code_sha`，再启动三路验证。这次输出落在：
 
 ```text
 .autogen/runs/run-2026-04-06-090000-demo/30-reviews/release-002/compliance/report.md
@@ -550,11 +570,12 @@ COMPLETE_ALL_STAGES
 - qa：通过
 - e2e：通过
 
-每一路照样：
+每一路照样只生成自己的报告文件；随后由 publisher workspace 串行发布：
 
-1. `git pull --rebase --autostash`
-2. 只提交自己那一路报告
-3. 推送到同一条 `run_branch`
+1. copy 到 publisher workspace
+2. `git pull --rebase --autostash`
+3. 只提交当前这一路报告
+4. 推送到同一条 `run_branch`
 
 ### Step 11. 第二次发布门禁，走到“通过”
 
@@ -709,7 +730,8 @@ PASS
 - 所有控制工件都进仓库
 - 阶段内允许连续修补
 - 阶段间强制重置上下文
-- 三路验证针对的是已提交候选版本
+- 三路验证针对的是固定的 `candidate_code_sha`
+- 报告发布由 publisher workspace 串行完成
 - 发布失败后必须带着 `rework-summary.md` 重新规划
 
 ## 11. 一句话总结
@@ -720,6 +742,6 @@ PASS
 - 再冻结执行合同
 - 按阶段实现
 - 每阶段有门禁
-- 所有阶段完成后做三路验证
+- 所有阶段完成后先冻结候选快照，再做三路验证
 - 发布失败就生成返工包并重新规划
 - 所有过程证据都写回同一条 `run_branch`

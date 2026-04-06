@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -10,20 +12,24 @@ from openai import AsyncOpenAI
 from langsmith.wrappers import wrap_openai
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.models.usage import RoleUsage
 from orchestrator.observability import traced_block
 from orchestrator.policy.role_policy import build_role_policy
 from orchestrator.services.artifact_service import ArtifactService
+from orchestrator.services.background_tasks import BackgroundTaskManager
 from orchestrator.services.docker_manager import DockerManager
 from orchestrator.services.git_service import GitService
+from orchestrator.services.prompt_loader import load_role_prompt
 from orchestrator.tools.artifact_tools import ArtifactToolset
 from orchestrator.tools.base import ToolContext, ToolSpec
 from orchestrator.tools.bash_tool import BashToolset
 from orchestrator.tools.file_tools import FileToolset
 from orchestrator.tools.git_tools import GitReadToolset
+from orchestrator.tools.task_tools import TaskToolset
 
 
-PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 logger = logging.getLogger(__name__)
+MAX_RESPONSE_RETRIES = 5
 
 
 def _require_path(actual_path: str, expected_path: str, *, label: str) -> None:
@@ -86,12 +92,14 @@ class OpenAIRoleRunner:
         artifact_service: ArtifactService,
         docker_manager: DockerManager,
         git_service: GitService,
+        background_tasks: BackgroundTaskManager,
     ) -> None:
         self._config = config
         self._langsmith_client = langsmith_client
         self._artifact_service = artifact_service
         self._docker = docker_manager
         self._git = git_service
+        self._background_tasks = background_tasks
         if config.openai_api_key:
             openai_client = AsyncOpenAI(api_key=config.openai_api_key)
             if langsmith_client is not None:
@@ -108,8 +116,7 @@ class OpenAIRoleRunner:
             self._client = None
 
     def _load_prompt(self, role: str) -> str:
-        prompt_path = PROMPT_DIR / f"{role}.md"
-        return prompt_path.read_text(encoding="utf-8")
+        return load_role_prompt(role)
 
     def _make_submit_tool(self, result_schema: dict[str, Any]) -> ToolSpec:
         async def _submit_result(args: dict[str, Any]) -> dict[str, Any]:
@@ -120,6 +127,7 @@ class OpenAIRoleRunner:
             description="Call this exactly once when the role has finished all work and is ready to return a structured result.",
             parameters=result_schema,
             handler=_submit_result,
+            read_only=True,
         )
 
     def _build_tools(
@@ -184,8 +192,88 @@ class OpenAIRoleRunner:
         specs.extend(ArtifactToolset(context, self._artifact_service).specs())
         specs.extend(BashToolset(context, self._docker, self._git, self._config).specs())
         specs.extend(GitReadToolset(context, self._git).specs())
+        specs.extend(TaskToolset(context, self._background_tasks).specs())
         specs.append(self._make_submit_tool(result_schema))
         return {spec.name: spec for spec in specs}
+
+    def _is_retryable_error(self, exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if status_code in {408, 409, 429, 500, 502, 503, 504}:
+            return True
+        response = getattr(exc, "response", None)
+        response_status = getattr(response, "status_code", None)
+        if response_status in {408, 409, 429, 500, 502, 503, 504}:
+            return True
+        message = str(exc).lower()
+        keywords = ("timeout", "temporar", "connection", "rate limit", "server error", "unavailable")
+        return any(keyword in message for keyword in keywords)
+
+    async def _create_response_with_retry(
+        self,
+        *,
+        usage: RoleUsage,
+        role: str,
+        model: str,
+        request_kwargs: dict[str, Any],
+    ):
+        for attempt in range(MAX_RESPONSE_RETRIES):
+            try:
+                response = await self._client.responses.create(**request_kwargs)
+                usage.add_response(response, pricing_by_model=self._config.model_pricing)
+                return response
+            except Exception as exc:
+                if attempt >= MAX_RESPONSE_RETRIES - 1 or not self._is_retryable_error(exc):
+                    raise
+                usage.add_retry()
+                delay = min(8.0, (2**attempt) + random.uniform(0.0, 0.5))
+                logger.warning(
+                    "role_model_retry",
+                    extra={
+                        "role": role,
+                        "model": model,
+                        "attempt": attempt + 1,
+                        "delay_seconds": delay,
+                        "error": str(exc),
+                    },
+                )
+                await asyncio.sleep(delay)
+
+    async def _execute_tool_call(
+        self,
+        *,
+        role: str,
+        workspace,
+        tools: dict[str, ToolSpec],
+        item,
+    ) -> dict[str, Any]:
+        raw_args = item.arguments if isinstance(item.arguments, str) else json.dumps(item.arguments)
+        parsed_args = json.loads(raw_args or "{}")
+        tool_spec = tools[item.name]
+        logger.info(
+            "role_tool_call",
+            extra={"role": role, "tool_name": item.name, "workspace_id": workspace.workspace_id},
+        )
+        async with traced_block(
+            enabled=self._langsmith_client is not None,
+            name=f"tool.{item.name}",
+            run_type="tool",
+            inputs={"arguments": parsed_args},
+            metadata={"role": role, "workspace_id": workspace.workspace_id},
+            tags=["autogen", "orchestrator", role, "tool"],
+            client=self._langsmith_client,
+        ) as tool_trace:
+            tool_result = await tool_spec.handler(parsed_args)
+            if tool_trace is not None:
+                tool_trace.end(
+                    outputs={
+                        "result_preview": json.dumps(tool_result, ensure_ascii=False)[:4000]
+                    }
+                )
+        return {
+            "type": "function_call_output",
+            "call_id": item.call_id,
+            "output": json.dumps(tool_result, ensure_ascii=False),
+        }
 
     async def _run_role(
         self,
@@ -209,6 +297,7 @@ class OpenAIRoleRunner:
             state=state,
             result_schema=result_schema,
         )
+        usage = RoleUsage(model=model)
         async with traced_block(
             enabled=self._langsmith_client is not None,
             name=f"role.{role}",
@@ -234,11 +323,16 @@ class OpenAIRoleRunner:
             tags=["autogen", "orchestrator", role],
             client=self._langsmith_client,
         ) as role_trace:
-            response = await self._client.responses.create(
+            response = await self._create_response_with_retry(
+                usage=usage,
+                role=role,
                 model=model,
-                instructions=system_prompt,
-                input=user_prompt,
-                tools=[spec.to_openai_tool() for spec in tools.values()],
+                request_kwargs={
+                    "model": model,
+                    "instructions": system_prompt,
+                    "input": user_prompt,
+                    "tools": [spec.to_openai_tool() for spec in tools.values()],
+                },
             )
             logger.info(
                 "role_started",
@@ -251,60 +345,70 @@ class OpenAIRoleRunner:
             )
 
             for step in range(64):
-                tool_outputs: list[dict[str, Any]] = []
+                tool_calls: list[tuple[Any, dict[str, Any]]] = []
                 for item in response.output:
                     if getattr(item, "type", None) != "function_call":
                         continue
                     raw_args = item.arguments if isinstance(item.arguments, str) else json.dumps(item.arguments)
                     parsed_args = json.loads(raw_args or "{}")
                     if item.name == "submit_result":
+                        parsed_args["usage"] = usage.to_dict()
                         if role_trace is not None:
                             role_trace.end(outputs={"result": parsed_args})
                         logger.info(
                             "role_completed",
-                            extra={"role": role, "workspace_id": workspace.workspace_id, "iterations": step + 1},
+                            extra={
+                                "role": role,
+                                "workspace_id": workspace.workspace_id,
+                                "iterations": step + 1,
+                                "usage": usage.to_dict(),
+                            },
                         )
                         return parsed_args
-                    tool_spec = tools[item.name]
-                    logger.info(
-                        "role_tool_call",
-                        extra={"role": role, "tool_name": item.name, "workspace_id": workspace.workspace_id},
-                    )
-                    async with traced_block(
-                        enabled=self._langsmith_client is not None,
-                        name=f"tool.{item.name}",
-                        run_type="tool",
-                        inputs={"arguments": parsed_args},
-                        metadata={"role": role, "workspace_id": workspace.workspace_id},
-                        tags=["autogen", "orchestrator", role, "tool"],
-                        client=self._langsmith_client,
-                    ) as tool_trace:
-                        tool_result = await tool_spec.handler(parsed_args)
-                        if tool_trace is not None:
-                            tool_trace.end(
-                                outputs={
-                                    "result_preview": json.dumps(tool_result, ensure_ascii=False)[:4000]
-                                }
-                            )
-                    tool_outputs.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": item.call_id,
-                            "output": json.dumps(tool_result, ensure_ascii=False),
-                        }
-                    )
+                    tool_calls.append((item, parsed_args))
 
-                if not tool_outputs:
+                if not tool_calls:
                     raise RuntimeError(
                         f"{role} did not call submit_result. Final model text:\n{response.output_text}"
                     )
 
-                response = await self._client.responses.create(
+                if all(tools[item.name].invocation_is_read_only(args) for item, args in tool_calls):
+                    tool_outputs = list(
+                        await asyncio.gather(
+                            *[
+                                self._execute_tool_call(
+                                    role=role,
+                                    workspace=workspace,
+                                    tools=tools,
+                                    item=item,
+                                )
+                                for item, _ in tool_calls
+                            ]
+                        )
+                    )
+                else:
+                    tool_outputs = []
+                    for item, _ in tool_calls:
+                        tool_outputs.append(
+                            await self._execute_tool_call(
+                                role=role,
+                                workspace=workspace,
+                                tools=tools,
+                                item=item,
+                            )
+                        )
+
+                response = await self._create_response_with_retry(
+                    usage=usage,
+                    role=role,
                     model=model,
-                    instructions=system_prompt,
-                    previous_response_id=response.id,
-                    input=tool_outputs,
-                    tools=[spec.to_openai_tool() for spec in tools.values()],
+                    request_kwargs={
+                        "model": model,
+                        "instructions": system_prompt,
+                        "previous_response_id": response.id,
+                        "input": tool_outputs,
+                        "tools": [spec.to_openai_tool() for spec in tools.values()],
+                    },
                 )
 
         raise RuntimeError(f"{role} exceeded the maximum number of tool iterations")

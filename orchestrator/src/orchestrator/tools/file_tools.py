@@ -35,6 +35,7 @@ class FileToolset:
                     "additionalProperties": False,
                 },
                 handler=self.list_files,
+                read_only=True,
             ),
             ToolSpec(
                 name="read_file",
@@ -50,6 +51,7 @@ class FileToolset:
                     "additionalProperties": False,
                 },
                 handler=self.read_file,
+                read_only=True,
             ),
             ToolSpec(
                 name="search_text",
@@ -65,6 +67,7 @@ class FileToolset:
                     "additionalProperties": False,
                 },
                 handler=self.search_text,
+                read_only=True,
             ),
         ]
         if self._include_write_tools:

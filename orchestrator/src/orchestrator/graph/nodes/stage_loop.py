@@ -10,6 +10,7 @@ from orchestrator.graph.nodes.common import (
     visible_relpath,
 )
 from orchestrator.models.state import OrchestrationState
+from orchestrator.models.usage import usage_summary_delta
 
 
 async def prepare_stage_workspace(state: OrchestrationState, app: OrchestratorApp) -> dict[str, Any]:
@@ -72,6 +73,7 @@ async def run_developer(state: OrchestrationState, app: OrchestratorApp) -> dict
         container_id=state["active_containers"]["stage_dev"],
     )
     return {
+        "usage_summary": usage_summary_delta("developer", result.get("usage")),
         "run_status": "DEVELOPING",
         "event_log": [{"event": "run_developer", "summary": result["summary"], "at": now_utc()}],
     }
@@ -96,6 +98,7 @@ async def run_stage_gate(state: OrchestrationState, app: OrchestratorApp) -> dic
         "attempt_no": attempt_no,
         "current_gate_decision": result["decision"],
         "current_stage_gate_path": result["gate_path"],
+        "usage_summary": usage_summary_delta("stage_gate", result.get("usage")),
         "event_log": [{"event": "run_stage_gate", "decision": result["decision"], "at": now_utc()}],
     }
 

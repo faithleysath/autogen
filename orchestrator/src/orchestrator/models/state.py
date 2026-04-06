@@ -5,6 +5,8 @@ from typing import Annotated, Any
 
 from typing_extensions import TypedDict
 
+from orchestrator.models.usage import merge_usage_summaries
+
 
 def merge_dicts(
     left: dict[str, Any] | None, right: dict[str, Any] | None
@@ -45,6 +47,7 @@ class OrchestrationState(TypedDict, total=False):
     release_decision_path: str | None
     rework_summary_path: str | None
     artifact_root_path: str
+    usage_summary: Annotated[dict[str, Any], merge_usage_summaries]
     last_error: dict[str, Any] | None
     event_log: Annotated[list[dict[str, Any]], operator.add]
 
@@ -75,6 +78,7 @@ def make_initial_state(repo_url: str, prd_markdown: str) -> OrchestrationState:
         "release_decision_path": None,
         "rework_summary_path": None,
         "artifact_root_path": "",
+        "usage_summary": {},
         "last_error": None,
         "event_log": [],
     }

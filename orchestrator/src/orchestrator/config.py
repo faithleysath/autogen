@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ class OrchestratorConfig:
     state_dir: Path
     sqlite_path: Path
     logs_dir: Path
+    tasks_dir: Path
     ssh_dir: Path | None
     docker_host: str
     dev_image: str
@@ -48,6 +50,7 @@ class OrchestratorConfig:
     review_timeout_seconds: int
     push_lock_timeout_seconds: int
     openai_api_key: str | None
+    model_pricing: dict[str, dict[str, float]]
 
     @classmethod
     def from_env(cls) -> "OrchestratorConfig":
@@ -60,6 +63,8 @@ class OrchestratorConfig:
         state_dir = _env_path("AUTOGEN_STATE_DIR") or (workspace_root / "_state")
         sqlite_path = _env_path("AUTOGEN_SQLITE_PATH") or (state_dir / "orchestrator.sqlite")
         ssh_dir = _env_path("AGENT_SSH_DIR")
+        pricing_raw = os.getenv("AUTOGEN_MODEL_PRICING_JSON")
+        model_pricing = json.loads(pricing_raw) if pricing_raw else {}
 
         default_model = os.getenv("AUTOGEN_MODEL_DEFAULT", "gpt-5.4")
 
@@ -68,6 +73,7 @@ class OrchestratorConfig:
             state_dir=state_dir,
             sqlite_path=sqlite_path,
             logs_dir=state_dir / "logs" / "orchestrator",
+            tasks_dir=state_dir / "tasks",
             ssh_dir=ssh_dir,
             docker_host=os.getenv("DOCKER_HOST", "unix:///var/run/docker.sock"),
             dev_image=os.getenv("AUTOGEN_DEV_IMAGE", "autogen-agent-dev"),
@@ -93,6 +99,7 @@ class OrchestratorConfig:
             review_timeout_seconds=int(os.getenv("AUTOGEN_REVIEW_TIMEOUT_SECONDS", "900")),
             push_lock_timeout_seconds=int(os.getenv("AUTOGEN_PUSH_LOCK_TIMEOUT_SECONDS", "120")),
             openai_api_key=os.getenv("OPENAI_API_KEY") or None,
+            model_pricing=model_pricing,
         )
 
     def model_for_role(self, role: str) -> str:

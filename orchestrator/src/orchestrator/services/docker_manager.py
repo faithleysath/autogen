@@ -29,6 +29,7 @@ class DockerManager:
         command: list[str] | None = None,
         labels: dict[str, str] | None = None,
     ) -> ContainerHandle:
+        self._config.tasks_dir.mkdir(parents=True, exist_ok=True)
         environment = {
             "HOST_UID": str(self._config.host_uid),
             "HOST_GID": str(self._config.host_gid),
@@ -38,6 +39,7 @@ class DockerManager:
         }
         volumes: dict[str, dict[str, str]] = {
             str(workspace_view.backing_root): {"bind": "/workspace", "mode": "rw"},
+            str(self._config.tasks_dir): {"bind": "/autogen-state/tasks", "mode": "rw"},
         }
         if self._config.ssh_dir:
             volumes[str(self._config.ssh_dir)] = {"bind": "/run/host-ssh", "mode": "ro"}

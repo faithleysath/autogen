@@ -23,6 +23,7 @@ class GitReadToolset:
                     "additionalProperties": False,
                 },
                 handler=self.git_status,
+                read_only=True,
             ),
             ToolSpec(
                 name="git_diff",
@@ -34,6 +35,7 @@ class GitReadToolset:
                     "additionalProperties": False,
                 },
                 handler=self.git_diff,
+                read_only=True,
             ),
             ToolSpec(
                 name="git_head",
@@ -45,6 +47,7 @@ class GitReadToolset:
                     "additionalProperties": False,
                 },
                 handler=self.git_head,
+                read_only=True,
             ),
         ]
 
