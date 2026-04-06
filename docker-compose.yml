@@ -13,6 +13,24 @@ services:
       LANGSMITH_WORKSPACE_ID: ${LANGSMITH_WORKSPACE_ID:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       AUTOGEN_WORKSPACE_ROOT: ${AUTOGEN_WORKSPACE_ROOT}
+      AUTOGEN_STATE_DIR: ${AUTOGEN_STATE_DIR:-}
+      AUTOGEN_SQLITE_PATH: ${AUTOGEN_SQLITE_PATH:-}
+      AUTOGEN_GIT_USER_NAME: ${AUTOGEN_GIT_USER_NAME:-Autogen}
+      AUTOGEN_GIT_USER_EMAIL: ${AUTOGEN_GIT_USER_EMAIL:-autogen@local}
+      AUTOGEN_DEV_IMAGE: ${AUTOGEN_DEV_IMAGE:-autogen-agent-dev}
+      AUTOGEN_E2E_IMAGE: ${AUTOGEN_E2E_IMAGE:-autogen-agent-e2e}
+      AUTOGEN_MODEL_DEFAULT: ${AUTOGEN_MODEL_DEFAULT:-gpt-5.4}
+      AUTOGEN_MODEL_ARCHITECT: ${AUTOGEN_MODEL_ARCHITECT:-}
+      AUTOGEN_MODEL_DEVELOPER: ${AUTOGEN_MODEL_DEVELOPER:-}
+      AUTOGEN_MODEL_GATE: ${AUTOGEN_MODEL_GATE:-}
+      AUTOGEN_MODEL_REVIEW: ${AUTOGEN_MODEL_REVIEW:-}
+      AUTOGEN_MODEL_RELEASE: ${AUTOGEN_MODEL_RELEASE:-}
+      AUTOGEN_CMD_TIMEOUT_SECONDS: ${AUTOGEN_CMD_TIMEOUT_SECONDS:-300}
+      AUTOGEN_CONTAINER_START_TIMEOUT_SECONDS: ${AUTOGEN_CONTAINER_START_TIMEOUT_SECONDS:-60}
+      AUTOGEN_REVIEW_TIMEOUT_SECONDS: ${AUTOGEN_REVIEW_TIMEOUT_SECONDS:-900}
+      AUTOGEN_PUSH_LOCK_TIMEOUT_SECONDS: ${AUTOGEN_PUSH_LOCK_TIMEOUT_SECONDS:-120}
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - type: bind
@@ -27,6 +45,8 @@ services:
     image: autogen-agent-dev
     environment:
       SSH_SOURCE_DIR: /run/host-ssh
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
     volumes:
       - ${AGENT_SSH_DIR:-./.secrets/ssh}:/run/host-ssh:ro
     working_dir: /workspace
@@ -42,6 +62,8 @@ services:
     image: autogen-agent-e2e
     environment:
       SSH_SOURCE_DIR: /run/host-ssh
+      HOST_UID: ${HOST_UID:-}
+      HOST_GID: ${HOST_GID:-}
     volumes:
       - ${AGENT_SSH_DIR:-./.secrets/ssh}:/run/host-ssh:ro
     working_dir: /workspace

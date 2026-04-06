@@ -1,0 +1,534 @@
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any, Protocol
+
+from langsmith import Client
+from openai import AsyncOpenAI
+from langsmith.wrappers import wrap_openai
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.observability import traced_block
+from orchestrator.policy.role_policy import build_role_policy
+from orchestrator.services.artifact_service import ArtifactService
+from orchestrator.services.docker_manager import DockerManager
+from orchestrator.services.git_service import GitService
+from orchestrator.tools.artifact_tools import ArtifactToolset
+from orchestrator.tools.base import ToolContext, ToolSpec
+from orchestrator.tools.bash_tool import BashToolset
+from orchestrator.tools.file_tools import FileToolset
+from orchestrator.tools.git_tools import GitReadToolset
+
+
+PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
+logger = logging.getLogger(__name__)
+
+
+class RoleRunnerProtocol(Protocol):
+    async def run_architect(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]: ...
+
+    async def run_developer(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]: ...
+
+    async def run_stage_gate(
+        self,
+        *,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+        is_final_stage: bool,
+    ) -> dict[str, Any]: ...
+
+    async def run_compliance(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]: ...
+
+    async def run_qa(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]: ...
+
+    async def run_e2e(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]: ...
+
+    async def run_release_gate(
+        self,
+        *,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+    ) -> dict[str, Any]: ...
+
+
+class OpenAIRoleRunner:
+    def __init__(
+        self,
+        config: OrchestratorConfig,
+        langsmith_client: Client | None,
+        artifact_service: ArtifactService,
+        docker_manager: DockerManager,
+        git_service: GitService,
+    ) -> None:
+        self._config = config
+        self._langsmith_client = langsmith_client
+        self._artifact_service = artifact_service
+        self._docker = docker_manager
+        self._git = git_service
+        if config.openai_api_key:
+            openai_client = AsyncOpenAI(api_key=config.openai_api_key)
+            if langsmith_client is not None:
+                openai_client = wrap_openai(
+                    openai_client,
+                    tracing_extra={
+                        "client": langsmith_client,
+                        "tags": ["autogen", "orchestrator", "openai"],
+                        "metadata": {"component": "role_runner"},
+                    },
+                )
+            self._client = openai_client
+        else:
+            self._client = None
+
+    def _load_prompt(self, role: str) -> str:
+        prompt_path = PROMPT_DIR / f"{role}.md"
+        return prompt_path.read_text(encoding="utf-8")
+
+    def _make_submit_tool(self, result_schema: dict[str, Any]) -> ToolSpec:
+        async def _submit_result(args: dict[str, Any]) -> dict[str, Any]:
+            return args
+
+        return ToolSpec(
+            name="submit_result",
+            description="Call this exactly once when the role has finished all work and is ready to return a structured result.",
+            parameters=result_schema,
+            handler=_submit_result,
+        )
+
+    def _build_tools(
+        self,
+        *,
+        role: str,
+        workspace,
+        container_id: str,
+        state: dict[str, Any],
+        result_schema: dict[str, Any],
+    ) -> dict[str, ToolSpec]:
+        if role == "architect":
+            policy = build_role_policy(
+                role=role,
+                run_id=state["run_id"],
+                cycle_no=state["cycle_no"],
+            )
+        elif role == "developer":
+            policy = build_role_policy(
+                role=role,
+                run_id=state["run_id"],
+                cycle_no=state["cycle_no"],
+            )
+        elif role == "stage_gate":
+            policy = build_role_policy(
+                role=role,
+                run_id=state["run_id"],
+                cycle_no=state["cycle_no"],
+                stage_no=state["stage_no"],
+                attempt_no=state["attempt_no"],
+            )
+        elif role in {"compliance", "qa", "e2e"}:
+            policy = build_role_policy(
+                role=role,
+                run_id=state["run_id"],
+                cycle_no=state["cycle_no"],
+                release_no=state["release_no"],
+            )
+        elif role == "release_gate":
+            policy = build_role_policy(
+                role=role,
+                run_id=state["run_id"],
+                cycle_no=state["cycle_no"],
+                release_no=state["release_no"],
+            )
+        else:
+            raise ValueError(f"unsupported role: {role}")
+
+        context = ToolContext(
+            role=role,
+            workspace=workspace,
+            container_id=container_id,
+            policy=policy,
+        )
+        specs: list[ToolSpec] = []
+        specs.extend(FileToolset(context).specs())
+        specs.extend(ArtifactToolset(context, self._artifact_service).specs())
+        specs.extend(BashToolset(context, self._docker, self._config).specs())
+        specs.extend(GitReadToolset(context, self._git).specs())
+        specs.append(self._make_submit_tool(result_schema))
+        return {spec.name: spec for spec in specs}
+
+    async def _run_role(
+        self,
+        *,
+        role: str,
+        model: str,
+        user_prompt: str,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+        result_schema: dict[str, Any],
+    ) -> dict[str, Any]:
+        if self._client is None:
+            raise RuntimeError("OPENAI_API_KEY is required to execute live role agents")
+
+        system_prompt = self._load_prompt(role)
+        tools = self._build_tools(
+            role=role,
+            workspace=workspace,
+            container_id=container_id,
+            state=state,
+            result_schema=result_schema,
+        )
+        async with traced_block(
+            enabled=self._langsmith_client is not None,
+            name=f"role.{role}",
+            run_type="chain",
+            inputs={
+                "role": role,
+                "workspace_id": workspace.workspace_id,
+                "container_id": container_id,
+                "state": {
+                    "run_id": state.get("run_id"),
+                    "cycle_no": state.get("cycle_no"),
+                    "stage_no": state.get("stage_no"),
+                    "attempt_no": state.get("attempt_no"),
+                    "release_no": state.get("release_no"),
+                },
+            },
+            metadata={
+                "role": role,
+                "model": model,
+                "workspace_id": workspace.workspace_id,
+                "container_id": container_id,
+            },
+            tags=["autogen", "orchestrator", role],
+            client=self._langsmith_client,
+        ) as role_trace:
+            response = await self._client.responses.create(
+                model=model,
+                instructions=system_prompt,
+                input=user_prompt,
+                tools=[spec.to_openai_tool() for spec in tools.values()],
+            )
+            logger.info(
+                "role_started",
+                extra={
+                    "role": role,
+                    "model": model,
+                    "workspace_id": workspace.workspace_id,
+                    "container_id": container_id,
+                },
+            )
+
+            for step in range(64):
+                tool_outputs: list[dict[str, Any]] = []
+                for item in response.output:
+                    if getattr(item, "type", None) != "function_call":
+                        continue
+                    raw_args = item.arguments if isinstance(item.arguments, str) else json.dumps(item.arguments)
+                    parsed_args = json.loads(raw_args or "{}")
+                    if item.name == "submit_result":
+                        if role_trace is not None:
+                            role_trace.end(outputs={"result": parsed_args})
+                        logger.info(
+                            "role_completed",
+                            extra={"role": role, "workspace_id": workspace.workspace_id, "iterations": step + 1},
+                        )
+                        return parsed_args
+                    tool_spec = tools[item.name]
+                    logger.info(
+                        "role_tool_call",
+                        extra={"role": role, "tool_name": item.name, "workspace_id": workspace.workspace_id},
+                    )
+                    async with traced_block(
+                        enabled=self._langsmith_client is not None,
+                        name=f"tool.{item.name}",
+                        run_type="tool",
+                        inputs={"arguments": parsed_args},
+                        metadata={"role": role, "workspace_id": workspace.workspace_id},
+                        tags=["autogen", "orchestrator", role, "tool"],
+                        client=self._langsmith_client,
+                    ) as tool_trace:
+                        tool_result = await tool_spec.handler(parsed_args)
+                        if tool_trace is not None:
+                            tool_trace.end(
+                                outputs={
+                                    "result_preview": json.dumps(tool_result, ensure_ascii=False)[:4000]
+                                }
+                            )
+                    tool_outputs.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": item.call_id,
+                            "output": json.dumps(tool_result, ensure_ascii=False),
+                        }
+                    )
+
+                if not tool_outputs:
+                    raise RuntimeError(
+                        f"{role} did not call submit_result. Final model text:\n{response.output_text}"
+                    )
+
+                response = await self._client.responses.create(
+                    model=model,
+                    instructions=system_prompt,
+                    previous_response_id=response.id,
+                    input=tool_outputs,
+                    tools=[spec.to_openai_tool() for spec in tools.values()],
+                )
+
+        raise RuntimeError(f"{role} exceeded the maximum number of tool iterations")
+
+    async def run_architect(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
+        cycle_no = state["cycle_no"]
+        run_id = state["run_id"]
+        planning_root = f"/workspace/.autogen/runs/{run_id}/10-planning/cycle-{cycle_no:03d}"
+        user_prompt = json.dumps(
+            {
+                "run_id": run_id,
+                "repo_url": state["repo_url"],
+                "cycle_no": cycle_no,
+                "prd_path": f"/workspace/.autogen/runs/{run_id}/00-input/prd.md",
+                "previous_execution_contract_path": state.get("execution_contract_path"),
+                "previous_rework_summary_path": state.get("rework_summary_path"),
+                "required_outputs": {
+                    "execution_contract_path": f"{planning_root}/execution-contract.md",
+                    "plan_path": f"{planning_root}/architecture-plan.md",
+                    "e2e_plan_path": f"{planning_root}/e2e-plan.md",
+                },
+                "artifact_requirements": {
+                    "execution_contract_kind": "execution_contract",
+                    "plan_kind": "architecture_plan",
+                    "plan_frontmatter_fields": ["stage_count", "stages"],
+                    "stage_shape": {
+                        "stage_id": "string",
+                        "goal": "string",
+                        "inputs": ["string"],
+                        "exit_criteria": ["string"],
+                    },
+                    "e2e_kind": "e2e_plan",
+                    "e2e_frontmatter_fields": ["scenario_count", "scenarios"],
+                },
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "execution_contract_path": {"type": "string"},
+                "plan_path": {"type": "string"},
+                "e2e_plan_path": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["execution_contract_path", "plan_path", "e2e_plan_path", "summary"],
+            "additionalProperties": False,
+        }
+        return await self._run_role(
+            role="architect",
+            model=self._config.model_for_role("architect"),
+            user_prompt=user_prompt,
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+            result_schema=schema,
+        )
+
+    async def run_developer(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
+        stage_plan = state["current_stage_plan"]
+        user_prompt = json.dumps(
+            {
+                "run_id": state["run_id"],
+                "cycle_no": state["cycle_no"],
+                "stage": stage_plan,
+                "execution_contract_path": state["execution_contract_path"],
+                "plan_path": state["plan_path"],
+                "latest_gate_path": state.get("current_stage_gate_path"),
+                "workspace_root": "/workspace",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "changed_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": ["summary", "changed_paths"],
+            "additionalProperties": False,
+        }
+        return await self._run_role(
+            role="developer",
+            model=self._config.model_for_role("developer"),
+            user_prompt=user_prompt,
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+            result_schema=schema,
+        )
+
+    async def run_stage_gate(
+        self,
+        *,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+        is_final_stage: bool,
+    ) -> dict[str, Any]:
+        gate_path = (
+            f"/workspace/.autogen/runs/{state['run_id']}/20-stages/"
+            f"stage-{state['stage_no']:03d}/attempt-{state['attempt_no']:03d}/gate-decision.md"
+        )
+        user_prompt = json.dumps(
+            {
+                "run_id": state["run_id"],
+                "cycle_no": state["cycle_no"],
+                "stage": state["current_stage_plan"],
+                "attempt_no": state["attempt_no"],
+                "execution_contract_path": state["execution_contract_path"],
+                "required_gate_path": gate_path,
+                "allowed_decisions": ["FAIL", "NEXT_STAGE", "COMPLETE_ALL_STAGES"],
+                "is_final_stage": is_final_stage,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["FAIL", "NEXT_STAGE", "COMPLETE_ALL_STAGES"],
+                },
+                "gate_path": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["decision", "gate_path", "summary"],
+            "additionalProperties": False,
+        }
+        return await self._run_role(
+            role="stage_gate",
+            model=self._config.model_for_role("stage_gate"),
+            user_prompt=user_prompt,
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+            result_schema=schema,
+        )
+
+    async def run_compliance(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
+        return await self._run_review_role(
+            role="compliance",
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+        )
+
+    async def run_qa(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
+        return await self._run_review_role(
+            role="qa",
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+        )
+
+    async def run_e2e(self, *, state: dict[str, Any], workspace, container_id: str) -> dict[str, Any]:
+        return await self._run_review_role(
+            role="e2e",
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+        )
+
+    async def _run_review_role(
+        self,
+        *,
+        role: str,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+    ) -> dict[str, Any]:
+        release_no = state["release_no"]
+        report_path = f"/workspace/.autogen/runs/{state['run_id']}/30-reviews/release-{release_no:03d}/{role}/report.md"
+        user_prompt = json.dumps(
+            {
+                "run_id": state["run_id"],
+                "release_no": release_no,
+                "candidate_code_sha": state["candidate_code_sha"],
+                "execution_contract_path": state["execution_contract_path"],
+                "e2e_plan_path": state.get("e2e_plan_path"),
+                "required_report_path": report_path,
+                "allowed_verdicts": ["PASS", "FAIL", "PARTIAL"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "report_path": {"type": "string"},
+                "verdict": {"type": "string", "enum": ["PASS", "FAIL", "PARTIAL"]},
+                "summary": {"type": "string"},
+            },
+            "required": ["report_path", "verdict", "summary"],
+            "additionalProperties": False,
+        }
+        return await self._run_role(
+            role=role,
+            model=self._config.model_for_role(role),
+            user_prompt=user_prompt,
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+            result_schema=schema,
+        )
+
+    async def run_release_gate(
+        self,
+        *,
+        state: dict[str, Any],
+        workspace,
+        container_id: str,
+    ) -> dict[str, Any]:
+        release_no = state["release_no"]
+        user_prompt = json.dumps(
+            {
+                "run_id": state["run_id"],
+                "release_no": release_no,
+                "execution_contract_path": state["execution_contract_path"],
+                "review_reports": {
+                    role: data["report_path"] for role, data in state["review_results"].items()
+                },
+                "required_decision_path": f"/workspace/.autogen/runs/{state['run_id']}/40-release/release-{release_no:03d}/decision.md",
+                "required_rework_path": f"/workspace/.autogen/runs/{state['run_id']}/50-rework/release-{release_no:03d}/rework-summary.md",
+                "allowed_decisions": ["PASS", "REWORK"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        schema = {
+            "type": "object",
+            "properties": {
+                "decision": {"type": "string", "enum": ["PASS", "REWORK"]},
+                "decision_path": {"type": "string"},
+                "rework_summary_path": {"type": "string"},
+                "summary": {"type": "string"},
+            },
+            "required": ["decision", "decision_path", "rework_summary_path", "summary"],
+            "additionalProperties": False,
+        }
+        return await self._run_role(
+            role="release_gate",
+            model=self._config.model_for_role("release_gate"),
+            user_prompt=user_prompt,
+            state=state,
+            workspace=workspace,
+            container_id=container_id,
+            result_schema=schema,
+        )

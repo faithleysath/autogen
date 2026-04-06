@@ -1,6 +1,5 @@
-def main():
-    print("Hello from orchestrator!")
+from orchestrator.main import main
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class RolePolicy:
+    role: str
+    writable_prefixes: tuple[str, ...]
+    allow_code_write: bool
+    allow_command: bool
+
+    def can_write(self, visible_path: str) -> bool:
+        if self.allow_code_write:
+            return not visible_path.startswith("/workspace/.git/") and not visible_path.startswith(
+                "/workspace/.autogen/"
+            )
+        return any(visible_path == prefix or visible_path.startswith(prefix) for prefix in self.writable_prefixes)
+
+    def assert_writable(self, visible_path: str) -> None:
+        if not self.can_write(visible_path):
+            raise PermissionError(f"{self.role} cannot write {visible_path}")
+
+
+def build_role_policy(
+    *,
+    role: str,
+    run_id: str,
+    cycle_no: int,
+    stage_no: int | None = None,
+    attempt_no: int | None = None,
+    release_no: int | None = None,
+) -> RolePolicy:
+    run_root = f"/workspace/.autogen/runs/{run_id}"
+    if role == "architect":
+        return RolePolicy(
+            role=role,
+            writable_prefixes=(
+                f"{run_root}/00-input/",
+                f"{run_root}/10-planning/cycle-{cycle_no:03d}/",
+            ),
+            allow_code_write=False,
+            allow_command=True,
+        )
+    if role == "developer":
+        return RolePolicy(
+            role=role,
+            writable_prefixes=(),
+            allow_code_write=True,
+            allow_command=True,
+        )
+    if role == "stage_gate":
+        assert stage_no is not None and attempt_no is not None
+        return RolePolicy(
+            role=role,
+            writable_prefixes=(
+                f"{run_root}/20-stages/stage-{stage_no:03d}/attempt-{attempt_no:03d}/gate-decision.md",
+            ),
+            allow_code_write=False,
+            allow_command=True,
+        )
+    if role in {"compliance", "qa", "e2e"}:
+        assert release_no is not None
+        return RolePolicy(
+            role=role,
+            writable_prefixes=(
+                f"{run_root}/30-reviews/release-{release_no:03d}/{role}/report.md",
+            ),
+            allow_code_write=False,
+            allow_command=True,
+        )
+    if role == "release_gate":
+        assert release_no is not None
+        return RolePolicy(
+            role=role,
+            writable_prefixes=(
+                f"{run_root}/40-release/release-{release_no:03d}/decision.md",
+                f"{run_root}/50-rework/release-{release_no:03d}/rework-summary.md",
+            ),
+            allow_code_write=False,
+            allow_command=False,
+        )
+    raise ValueError(f"unknown role: {role}")

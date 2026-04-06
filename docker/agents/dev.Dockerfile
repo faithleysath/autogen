@@ -13,6 +13,7 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        gosu \
         jq \
         openssh-client \
         pkg-config \

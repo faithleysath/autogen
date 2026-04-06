@@ -79,3 +79,28 @@ docker compose --profile manual-agents exec agent-dev ssh -T git@github.com
 docker compose logs -f orchestrator
 docker compose down
 ```
+
+## Orchestrator CLI
+
+The Python orchestrator now lives in `/Users/laysath/proj/autogen/orchestrator` and exposes a CLI entrypoint:
+
+```bash
+cd /Users/laysath/proj/autogen/orchestrator
+uv sync --all-extras
+uv run orchestrator --help
+uv run orchestrator graph --thread-id graph-preview
+uv run orchestrator run \
+  --repo-url git@github.com:your-org/your-repo.git \
+  --prd-file /absolute/path/to/prd.md \
+  --thread-id run-001
+```
+
+To execute live agent roles, `OPENAI_API_KEY` must be set.
+
+Runtime logs now write both to stderr and to:
+
+```text
+${AUTOGEN_STATE_DIR:-$AUTOGEN_WORKSPACE_ROOT/_state}/logs/orchestrator/<thread_id>.log
+```
+
+With `LANGSMITH_TRACING=true` plus valid LangSmith credentials, the orchestrator also emits explicit LangSmith traces for root runs, graph nodes, role executions, tool calls, and wrapped OpenAI model calls.
