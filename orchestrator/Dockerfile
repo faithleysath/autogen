@@ -30,10 +30,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN useradd --create-home --shell /bin/bash appuser
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --shell /bin/bash appuser
 
 COPY --from=builder --chown=appuser:appuser /app /app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-USER appuser
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python", "main.py"]
