@@ -87,11 +87,20 @@ class TaskToolset:
         if not self._context.policy.allow_background_tasks:
             raise PermissionError(f"{self._context.role} cannot create background tasks")
         argv = [str(item) for item in args["argv"]]
-        _validate_command(argv)
+        _validate_command(
+            argv,
+            allowed_external_path_prefixes=self._context.policy.allowed_external_path_prefixes,
+        )
         cwd = str(args["cwd"])
         self._context.workspace.ensure_within_workspace(cwd)
         for candidate in _iter_path_candidates(argv):
-            self._context.workspace.ensure_within_workspace(_resolve_visible_path(candidate, cwd))
+            resolved_candidate = _resolve_visible_path(candidate, cwd)
+            try:
+                self._context.workspace.ensure_within_workspace(resolved_candidate)
+            except ValueError as exc:
+                if self._context.policy.can_access_external_path(resolved_candidate):
+                    continue
+                raise PermissionError(str(exc)) from exc
         return await self._background_tasks.create_command_task(
             workspace=self._context.workspace,
             container_id=self._context.container_id,

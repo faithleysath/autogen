@@ -12,7 +12,7 @@ ROLE_SKILL_MAP: dict[str, tuple[str, ...]] = {
     "stage_gate": ("verification-evidence", "artifact-discipline"),
     "compliance": ("verification-evidence", "artifact-discipline"),
     "qa": ("verification-evidence", "artifact-discipline"),
-    "e2e": ("verification-evidence", "artifact-discipline"),
+    "e2e": ("playwright-best-practices", "verification-evidence", "artifact-discipline"),
     "release_gate": ("release-adjudication", "artifact-discipline"),
 }
 

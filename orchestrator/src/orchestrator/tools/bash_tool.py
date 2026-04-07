@@ -26,7 +26,9 @@ READ_ONLY_GIT_SUBCOMMANDS = {
 ALLOWED_PRIMARY_COMMANDS = {
     "bun",
     "bunx",
+    "cat",
     "date",
+    "env",
     "find",
     "head",
     "ls",
@@ -44,10 +46,19 @@ ALLOWED_PRIMARY_COMMANDS = {
     "sed",
     "tail",
     "wc",
+    "which",
     "yarn",
     "git",
 }
 DISALLOWED_INLINE_FLAGS = {"-c", "-e", "--eval"}
+TRANSIENT_COMMAND_OUTPUT_PREFIXES = (
+    "node_modules/",
+    "dist/",
+    "playwright-report/",
+    "test-results/",
+    ".vite/",
+)
+TRANSIENT_COMMAND_OUTPUT_SUFFIXES = (".tsbuildinfo",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,17 +69,32 @@ class PathSnapshot:
     symlink_target: str | None = None
 
 
-def _validate_command(argv: list[str]) -> None:
+def _matches_allowed_external_prefix(path: str, prefixes: tuple[str, ...]) -> bool:
+    return any(path == prefix or path.startswith(f"{prefix.rstrip('/')}/") for prefix in prefixes)
+
+
+def _validate_command(
+    argv: list[str],
+    *,
+    allowed_external_path_prefixes: tuple[str, ...] = (),
+) -> None:
     if not argv:
         raise ValueError("argv must not be empty")
     primary = argv[0]
-    if primary not in ALLOWED_PRIMARY_COMMANDS:
+    normalized_primary = primary
+    if PurePosixPath(primary).is_absolute():
+        if not _matches_allowed_external_prefix(primary, allowed_external_path_prefixes):
+            raise PermissionError(f"command is not allowed: {primary}")
+        normalized_primary = PurePosixPath(primary).name
+    if normalized_primary not in ALLOWED_PRIMARY_COMMANDS:
         raise PermissionError(f"command is not allowed: {primary}")
-    if primary == "git":
+    if normalized_primary == "git":
         if len(argv) < 2 or argv[1] not in READ_ONLY_GIT_SUBCOMMANDS:
             raise PermissionError("git command is restricted to read-only subcommands")
-    if primary in {"python", "python3", "node"} and any(flag in DISALLOWED_INLINE_FLAGS for flag in argv[1:]):
-        raise PermissionError(f"{primary} inline evaluation flags are not allowed")
+    if normalized_primary in {"python", "python3", "node"} and any(
+        flag in DISALLOWED_INLINE_FLAGS for flag in argv[1:]
+    ):
+        raise PermissionError(f"{normalized_primary} inline evaluation flags are not allowed")
 
 
 def _looks_like_path_token(token: str) -> bool:
@@ -94,6 +120,16 @@ def _resolve_visible_path(candidate: str, cwd: str) -> str:
     if candidate_path.is_absolute():
         return str(candidate_path)
     return str(PurePosixPath(cwd).joinpath(candidate_path))
+
+
+def _is_tolerated_command_side_effect(repo_path: str) -> bool:
+    return repo_path.startswith(TRANSIENT_COMMAND_OUTPUT_PREFIXES) or repo_path.endswith(
+        TRANSIENT_COMMAND_OUTPUT_SUFFIXES
+    )
+
+
+def _should_cleanup_tolerated_side_effect(repo_path: str) -> bool:
+    return repo_path.endswith(TRANSIENT_COMMAND_OUTPUT_SUFFIXES)
 
 
 class BashToolset:
@@ -140,16 +176,22 @@ class BashToolset:
         if not self._context.policy.allow_command:
             raise PermissionError(f"{self._context.role} cannot run commands")
         argv = [str(item) for item in args["argv"]]
-        _validate_command(argv)
+        _validate_command(
+            argv,
+            allowed_external_path_prefixes=self._context.policy.allowed_external_path_prefixes,
+        )
         cwd = str(args["cwd"])
         try:
             self._context.workspace.ensure_within_workspace(cwd)
         except ValueError as exc:
             raise PermissionError(str(exc)) from exc
         for candidate in _iter_path_candidates(argv):
+            resolved_candidate = _resolve_visible_path(candidate, cwd)
             try:
-                self._context.workspace.ensure_within_workspace(_resolve_visible_path(candidate, cwd))
+                self._context.workspace.ensure_within_workspace(resolved_candidate)
             except ValueError as exc:
+                if self._context.policy.can_access_external_path(resolved_candidate):
+                    continue
                 raise PermissionError(str(exc)) from exc
 
         before_dirty: set[str] = set()
@@ -227,6 +269,8 @@ class BashToolset:
             visible_path = f"/workspace/{repo_path}"
             if self._context.policy.can_write(visible_path):
                 continue
+            if _is_tolerated_command_side_effect(repo_path):
+                continue
             snapshots[repo_path] = self._snapshot_path(repo_path)
         return changed_paths, snapshots
 
@@ -248,10 +292,23 @@ class BashToolset:
                 violations.add(repo_path)
                 self._restore_snapshot(repo_path, snapshot)
 
+        transient_cleanup = sorted(
+            repo_path
+            for repo_path in (after_dirty - before_dirty)
+            if _should_cleanup_tolerated_side_effect(repo_path)
+        )
+        if transient_cleanup:
+            await self._git.best_effort_revert_paths(
+                container_id=self._context.container_id,
+                workspace=self._context.workspace,
+                paths=transient_cleanup,
+            )
+
         new_disallowed = sorted(
             repo_path
             for repo_path in (after_dirty - before_dirty)
             if not self._context.policy.can_write(f"/workspace/{repo_path}")
+            and not _is_tolerated_command_side_effect(repo_path)
         )
         if new_disallowed:
             violations.update(new_disallowed)

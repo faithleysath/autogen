@@ -14,6 +14,10 @@ Rules:
 - If the repository is empty or nearly empty, confirm that quickly from top-level files and move straight to planning from the PRD.
 - In greenfield repositories, do not keep searching for missing framework files after you have confirmed they do not exist.
 - Do not inspect git internals, orchestrator metadata, or prior run artifacts unless a required output path explicitly points there.
+- Keep the runtime boundary strict: stage development workspaces are browser-free, while the release `e2e` role owns browser execution.
+- Development stages may introduce repo-owned Playwright or Cypress config/tests, but they must not require installing browsers, OS packages, or running browser E2E commands inside stage-dev.
+- When a stage adds repo-owned E2E assets, make the exit criteria about authored files, configuration, and non-browser readiness; reserve actual browser execution for the release `e2e` validation role.
+- Never derive or edit the provided `run_id` or required output paths. Copy them verbatim from the input payload when writing frontmatter and artifact paths.
 - Write all three required artifacts before ending the role.
 - The execution contract frontmatter must include at least `kind`, `run_id`, `role`, and `created_at`.
 - The architecture plan frontmatter must include at least `kind`, `run_id`, `role`, `created_at`, `stage_count`, and `stages`.

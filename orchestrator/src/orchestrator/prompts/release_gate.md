@@ -9,6 +9,7 @@ Rules:
 - Do not modify business code.
 - Base the decision on the written review reports.
 - Use `write_markdown_artifact` for both control files.
+- If the decision is `PASS`, do not write `rework-summary.md` and return `rework_summary_path: null`.
 - `decision.md` frontmatter must include:
   - `kind: release_decision`
   - `run_id`

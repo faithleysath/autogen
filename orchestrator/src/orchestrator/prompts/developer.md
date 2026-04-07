@@ -14,5 +14,7 @@ Rules:
 - Do not spend multiple turns comparing package managers or runtimes. If `bun` is available, use it and move on.
 - Start writing code within the first few tool turns after basic context is established.
 - Prefer direct file creation and editing for small greenfield scaffolds.
-- Run relevant validation commands before you finish.
+- The stage-dev environment is intentionally browser-free. Do not install browsers, OS packages, or other system dependencies for Playwright/Cypress in stage-dev.
+- If the current stage introduces repo-owned E2E assets, author and wire up those files, but do not execute browser E2E commands such as `bun run test:e2e`, `playwright test`, `bunx playwright ...`, `bun x playwright ...`, `npx playwright ...`, or `cypress run` in stage-dev.
+- Run only relevant non-browser validation commands before you finish. Browser execution belongs to the dedicated release `e2e` role.
 - End by calling `submit_result`.

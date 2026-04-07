@@ -11,6 +11,7 @@ class RolePolicy:
     allow_code_write: bool
     allow_command: bool
     allow_background_tasks: bool
+    allowed_external_path_prefixes: tuple[str, ...] = ()
 
     def can_write(self, visible_path: str) -> bool:
         if self.allow_code_write:
@@ -24,6 +25,12 @@ class RolePolicy:
     def assert_writable(self, visible_path: str) -> None:
         if not self.can_write(visible_path):
             raise PermissionError(f"{self.role} cannot write {visible_path}")
+
+    def can_access_external_path(self, visible_path: str) -> bool:
+        return any(
+            visible_path == prefix or visible_path.startswith(f"{prefix.rstrip('/')}/")
+            for prefix in self.allowed_external_path_prefixes
+        )
 
 
 def build_role_policy(
@@ -44,6 +51,7 @@ def build_role_policy(
                 f"{run_root}/00-input/",
                 f"{run_root}/10-planning/cycle-{cycle_no:03d}/",
             ),
+            allowed_external_path_prefixes=(),
             allow_code_write=False,
             allow_command=True,
             allow_background_tasks=False,
@@ -53,6 +61,7 @@ def build_role_policy(
             role=role,
             writable_paths=(),
             writable_prefixes=(),
+            allowed_external_path_prefixes=(),
             allow_code_write=True,
             allow_command=True,
             allow_background_tasks=True,
@@ -65,9 +74,10 @@ def build_role_policy(
                 f"{run_root}/20-stages/stage-{stage_no:03d}/attempt-{attempt_no:03d}/gate-decision.md",
             ),
             writable_prefixes=(),
+            allowed_external_path_prefixes=(),
             allow_code_write=False,
             allow_command=True,
-            allow_background_tasks=False,
+            allow_background_tasks=True,
         )
     if role in {"compliance", "qa"}:
         assert release_no is not None
@@ -77,6 +87,7 @@ def build_role_policy(
                 f"{run_root}/30-reviews/release-{release_no:03d}/{role}/report.md",
             ),
             writable_prefixes=(),
+            allowed_external_path_prefixes=(),
             allow_code_write=False,
             allow_command=True,
             allow_background_tasks=False,
@@ -91,6 +102,10 @@ def build_role_policy(
             writable_prefixes=(
                 f"{run_root}/30-reviews/release-{release_no:03d}/e2e/evidence/",
             ),
+            allowed_external_path_prefixes=(
+                "/ms-playwright",
+                "/opt/bun/bin",
+            ),
             allow_code_write=False,
             allow_command=True,
             allow_background_tasks=True,
@@ -104,6 +119,7 @@ def build_role_policy(
                 f"{run_root}/50-rework/release-{release_no:03d}/rework-summary.md",
             ),
             writable_prefixes=(),
+            allowed_external_path_prefixes=(),
             allow_code_write=False,
             allow_command=False,
             allow_background_tasks=False,

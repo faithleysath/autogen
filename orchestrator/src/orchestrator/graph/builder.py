@@ -132,11 +132,10 @@ def build_graph(app: OrchestratorApp):
     builder.add_conditional_edges("publish_stage_gate_result", route_stage_outcome)
 
     builder.add_edge("freeze_release_candidate", "prepare_review_workspaces")
+    # Run release reviews serially to avoid bursting providers with strict rate limits.
     builder.add_edge("prepare_review_workspaces", "run_compliance_review")
-    builder.add_edge("prepare_review_workspaces", "run_qa_review")
-    builder.add_edge("prepare_review_workspaces", "run_e2e_review")
-    builder.add_edge("run_compliance_review", "join_review_results")
-    builder.add_edge("run_qa_review", "join_review_results")
+    builder.add_edge("run_compliance_review", "run_qa_review")
+    builder.add_edge("run_qa_review", "run_e2e_review")
     builder.add_edge("run_e2e_review", "join_review_results")
     builder.add_edge("join_review_results", "publish_review_reports")
     builder.add_edge("publish_review_reports", "run_release_gate")

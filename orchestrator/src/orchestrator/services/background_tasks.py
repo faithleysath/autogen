@@ -84,7 +84,9 @@ class BackgroundTaskManager:
         )
         result = await self._docker.exec(
             container_id=container_id,
-            cmd=["sh", "-lc", script],
+            # Use a non-login shell so Docker exec environment overrides for Bun
+            # and Playwright remain available to the background process.
+            cmd=["sh", "-c", script],
             cwd="/workspace",
             timeout_seconds=30,
         )
@@ -149,7 +151,7 @@ class BackgroundTaskManager:
         try:
             await self._docker.exec(
                 container_id=record.container_id,
-                cmd=["sh", "-lc", self._build_stop_script(record.pid)],
+                cmd=["sh", "-c", self._build_stop_script(record.pid)],
                 cwd="/workspace",
                 timeout_seconds=15,
             )
@@ -216,7 +218,7 @@ class BackgroundTaskManager:
         try:
             result = await self._docker.exec(
                 container_id=record.container_id,
-                cmd=["sh", "-lc", f"kill -0 {record.pid} >/dev/null 2>&1"],
+                cmd=["sh", "-c", f"kill -0 {record.pid} >/dev/null 2>&1"],
                 cwd="/workspace",
                 timeout_seconds=10,
             )

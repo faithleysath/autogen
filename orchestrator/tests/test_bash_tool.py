@@ -50,6 +50,8 @@ def _make_context(tmp_path, *, role: str) -> ToolContext:
     policy_kwargs = {"role": role, "run_id": "run-1", "cycle_no": 1}
     if role == "stage_gate":
         policy_kwargs.update({"stage_no": 1, "attempt_no": 1})
+    if role in {"compliance", "qa", "e2e", "release_gate"}:
+        policy_kwargs.update({"release_no": 1})
     policy = build_role_policy(**policy_kwargs)
     return ToolContext(
         role=role,
@@ -130,3 +132,84 @@ async def test_run_command_allows_date_for_read_only_time_lookup(tmp_path):
 
     assert result["argv"] == ["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"]
     assert docker.calls == [(["date", "-u", "+%Y-%m-%dT%H:%M:%SZ"], "/workspace")]
+
+
+@pytest.mark.anyio
+async def test_e2e_run_command_allows_external_playwright_cache_inspection(tmp_path):
+    context = _make_context(tmp_path, role="e2e")
+    docker = FakeDockerManager()
+    tool = BashToolset(
+        context,
+        docker,
+        FakeGitService([[], []]),
+        SimpleNamespace(review_timeout_seconds=60),
+    )
+
+    await tool.run_command(
+        {
+            "argv": ["ls", "/ms-playwright"],
+            "cwd": "/workspace",
+            "timeout_seconds": 10,
+        }
+    )
+
+    assert docker.calls == [(["ls", "/ms-playwright"], "/workspace")]
+
+
+@pytest.mark.anyio
+async def test_stage_gate_run_command_tolerates_and_cleans_tsbuildinfo_side_effects(tmp_path):
+    context = _make_context(tmp_path, role="stage_gate")
+
+    def mutator(cmd: list[str], cwd: str) -> None:
+        del cmd, cwd
+        target = tmp_path / "tsconfig.tsbuildinfo"
+        target.write_text("{}", encoding="utf-8")
+
+    git = FakeGitService([[], ["tsconfig.tsbuildinfo"]])
+    tool = BashToolset(
+        context,
+        FakeDockerManager(mutator=mutator),
+        git,
+        SimpleNamespace(review_timeout_seconds=60),
+    )
+
+    result = await tool.run_command(
+        {
+            "argv": ["bun", "run", "build"],
+            "cwd": "/workspace",
+            "timeout_seconds": 10,
+        }
+    )
+
+    assert result["exit_code"] == 0
+    assert git.reverted_paths == ["tsconfig.tsbuildinfo"]
+
+
+@pytest.mark.anyio
+async def test_e2e_run_command_tolerates_node_modules_side_effects(tmp_path):
+    context = _make_context(tmp_path, role="e2e")
+
+    def mutator(cmd: list[str], cwd: str) -> None:
+        del cmd, cwd
+        target = tmp_path / "node_modules" / ".bin" / "vite"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("vite", encoding="utf-8")
+
+    git = FakeGitService([[], ["node_modules/.bin/vite"]])
+    tool = BashToolset(
+        context,
+        FakeDockerManager(mutator=mutator),
+        git,
+        SimpleNamespace(review_timeout_seconds=60),
+    )
+
+    result = await tool.run_command(
+        {
+            "argv": ["bun", "install"],
+            "cwd": "/workspace",
+            "timeout_seconds": 10,
+        }
+    )
+
+    assert result["exit_code"] == 0
+    assert git.reverted_paths == []

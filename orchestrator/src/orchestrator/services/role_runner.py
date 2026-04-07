@@ -33,6 +33,38 @@ from orchestrator.tools.task_tools import TaskToolset
 
 logger = logging.getLogger(__name__)
 MAX_RESPONSE_RETRIES = 5
+_STAGE_DEV_BROWSER_COMMAND_MARKERS = (
+    "bun run test:e2e",
+    "playwright test",
+    "bunx playwright",
+    "bun x playwright",
+    "npx playwright",
+    "cypress run",
+    "cypress open",
+)
+_STAGE_DEV_BROWSER_EXECUTION_HINTS = (
+    " passes",
+    " succeeds",
+    " successful",
+    " runs successfully",
+    " execute ",
+    " executes",
+    " executed",
+    " running ",
+    " verify by running",
+)
+_STAGE_DEV_BROWSER_NON_EXECUTION_HINTS = (
+    " configured",
+    " documented",
+    " exists",
+    " present",
+    " added",
+    " declared",
+    " references",
+    " usage",
+    " script",
+    " config",
+)
 
 
 def _require_path(actual_path: str, expected_path: str, *, label: str) -> None:
@@ -64,6 +96,109 @@ def _first_present(meta: dict[str, Any], *fields: str) -> Any:
         if value not in (None, ""):
             return value
     return None
+
+
+def _contains_stage_dev_browser_execution(text: str) -> bool:
+    normalized = text.strip().lower()
+    if not any(marker in normalized for marker in _STAGE_DEV_BROWSER_COMMAND_MARKERS):
+        return False
+    if any(hint in normalized for hint in _STAGE_DEV_BROWSER_EXECUTION_HINTS):
+        return True
+    if any(hint in normalized for hint in _STAGE_DEV_BROWSER_NON_EXECUTION_HINTS):
+        return False
+    return True
+
+
+def _validate_stage_dev_boundaries(raw_stages: list[dict[str, Any]], *, path: str) -> None:
+    violations: list[str] = []
+    for index, raw in enumerate(raw_stages, start=1):
+        stage_label = str(raw.get("stage_id") or f"stage-{index:03d}")
+        for criterion in raw.get("exit_criteria", []):
+            criterion_text = str(criterion)
+            if _contains_stage_dev_browser_execution(criterion_text):
+                violations.append(
+                    f"{stage_label} exit_criteria assigns browser execution to stage-dev: {criterion_text}"
+                )
+    if violations:
+        joined = "\n".join(f"- {item}" for item in violations)
+        raise RuntimeError(
+            f"{path} violates the stage-dev/browser boundary.\n"
+            "Stage plans may author repo-owned E2E assets in stage-dev, but actual browser execution must stay in the release e2e role.\n"
+            f"{joined}"
+        )
+
+
+def _normalize_execution_contract_meta(
+    meta: dict[str, Any],
+    *,
+    run_id: str,
+) -> dict[str, Any]:
+    normalized = dict(meta)
+    normalized["kind"] = str(_first_present(meta, "kind") or "execution_contract")
+    normalized["run_id"] = str(run_id)
+    normalized["role"] = str(_first_present(meta, "role") or "architect")
+    normalized["created_at"] = _control_timestamp(meta)
+    return normalized
+
+
+def _normalize_architecture_plan_meta(
+    meta: dict[str, Any],
+    *,
+    run_id: str,
+) -> dict[str, Any]:
+    stages = [dict(stage) for stage in meta.get("stages", [])]
+    normalized = dict(meta)
+    normalized["kind"] = str(_first_present(meta, "kind") or "architecture_plan")
+    normalized["run_id"] = str(run_id)
+    normalized["role"] = str(_first_present(meta, "role") or "architect")
+    normalized["created_at"] = _control_timestamp(meta)
+    normalized["stage_count"] = len(stages)
+    normalized["stages"] = stages
+    return normalized
+
+
+def _normalize_e2e_plan_meta(
+    meta: dict[str, Any],
+    *,
+    run_id: str,
+) -> dict[str, Any]:
+    scenarios = [dict(item) for item in meta.get("scenarios", [])]
+    normalized = dict(meta)
+    normalized["kind"] = str(_first_present(meta, "kind") or "e2e_plan")
+    normalized["run_id"] = str(run_id)
+    normalized["role"] = str(_first_present(meta, "role") or "architect")
+    normalized["created_at"] = _control_timestamp(meta)
+    normalized["scenario_count"] = len(scenarios)
+    normalized["scenarios"] = scenarios
+    return normalized
+
+
+def _parse_tool_arguments(raw_args: str, *, tool_name: str) -> dict[str, Any]:
+    candidate = raw_args or "{}"
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{tool_name} arguments must be valid JSON. "
+            f"Parse error: {exc.msg} at line {exc.lineno} column {exc.colno}."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{tool_name} arguments must decode to a JSON object.")
+    return parsed
+
+
+def _invalid_tool_call_output(*, item, error: str) -> dict[str, Any]:
+    return {
+        "type": "function_call_output",
+        "call_id": getattr(item, "call_id", None) or getattr(item, "id"),
+        "output": json.dumps(
+            {
+                "error": error,
+                "error_type": "InvalidToolArguments",
+            },
+            ensure_ascii=False,
+        ),
+    }
 
 
 def _control_timestamp(meta: dict[str, Any]) -> str:
@@ -325,7 +460,7 @@ class OpenAIRoleRunner:
                 if attempt >= MAX_RESPONSE_RETRIES - 1 or not self._is_retryable_error(exc):
                     raise
                 usage.add_retry()
-                delay = min(8.0, (2**attempt) + random.uniform(0.0, 0.5))
+                delay = self._retry_delay_seconds(exc, attempt)
                 logger.warning(
                     "role_model_retry",
                     extra={
@@ -360,7 +495,7 @@ class OpenAIRoleRunner:
                 if attempt >= MAX_RESPONSE_RETRIES - 1 or not self._is_retryable_error(exc):
                     raise
                 usage.add_retry()
-                delay = min(8.0, (2**attempt) + random.uniform(0.0, 0.5))
+                delay = self._retry_delay_seconds(exc, attempt)
                 logger.warning(
                     "role_model_retry",
                     extra={
@@ -416,6 +551,19 @@ class OpenAIRoleRunner:
         )
         return [{"role": "user", "content": combined_prompt}]
 
+    def _retry_delay_seconds(self, exc: Exception, attempt: int) -> float:
+        message = str(exc)
+        normalized_message = message.lower()
+        is_rate_limited = (
+            getattr(exc, "status_code", None) == 429
+            or "429" in normalized_message
+            or "rate limit" in normalized_message
+            or "速率限制" in message
+        )
+        if is_rate_limited:
+            return min(30.0, (2**attempt) * 4.0 + random.uniform(0.0, 1.0))
+        return min(8.0, (2**attempt) + random.uniform(0.0, 0.5))
+
     def _history_items_from_response(self, response) -> list[dict[str, Any]]:
         history_items: list[dict[str, Any]] = []
         for item in getattr(response, "output", []):
@@ -438,9 +586,8 @@ class OpenAIRoleRunner:
         workspace,
         tools: dict[str, ToolSpec],
         item,
+        parsed_args: dict[str, Any],
     ) -> dict[str, Any]:
-        raw_args = item.arguments if isinstance(item.arguments, str) else json.dumps(item.arguments)
-        parsed_args = json.loads(raw_args or "{}")
         tool_spec = tools[item.name]
         logger.info(
             "role_tool_call",
@@ -601,11 +748,26 @@ class OpenAIRoleRunner:
 
             for step in range(64):
                 tool_calls: list[tuple[Any, dict[str, Any]]] = []
+                parse_error_outputs: list[dict[str, Any]] = []
                 for item in response.output:
                     if getattr(item, "type", None) != "function_call":
                         continue
                     raw_args = item.arguments if isinstance(item.arguments, str) else json.dumps(item.arguments)
-                    parsed_args = json.loads(raw_args or "{}")
+                    try:
+                        parsed_args = _parse_tool_arguments(raw_args, tool_name=item.name)
+                    except ValueError as exc:
+                        logger.warning(
+                            "role_tool_call_failed",
+                            extra={
+                                "role": role,
+                                "tool_name": item.name,
+                                "workspace_id": workspace.workspace_id,
+                                "error_type": "InvalidToolArguments",
+                                "error": str(exc),
+                            },
+                        )
+                        parse_error_outputs.append(_invalid_tool_call_output(item=item, error=str(exc)))
+                        continue
                     if item.name == "submit_result":
                         parsed_args["usage"] = usage.to_dict()
                         if role_trace is not None:
@@ -622,12 +784,13 @@ class OpenAIRoleRunner:
                         return parsed_args
                     tool_calls.append((item, parsed_args))
 
-                if not tool_calls:
+                if parse_error_outputs:
+                    tool_outputs = parse_error_outputs
+                elif not tool_calls:
                     raise RuntimeError(
                         f"{role} did not call submit_result. Final model text:\n{response.output_text}"
                     )
-
-                if all(tools[item.name].invocation_is_read_only(args) for item, args in tool_calls):
+                elif all(tools[item.name].invocation_is_read_only(args) for item, args in tool_calls):
                     tool_outputs = list(
                         await asyncio.gather(
                             *[
@@ -636,20 +799,22 @@ class OpenAIRoleRunner:
                                     workspace=workspace,
                                     tools=tools,
                                     item=item,
+                                    parsed_args=args,
                                 )
-                                for item, _ in tool_calls
+                                for item, args in tool_calls
                             ]
                         )
                     )
                 else:
                     tool_outputs = []
-                    for item, _ in tool_calls:
+                    for item, args in tool_calls:
                         tool_outputs.append(
                             await self._execute_tool_call(
                                 role=role,
                                 workspace=workspace,
                                 tools=tools,
                                 item=item,
+                                parsed_args=args,
                             )
                         )
 
@@ -759,11 +924,26 @@ class OpenAIRoleRunner:
                 messages.append(assistant_message)
 
                 pending_tool_calls: list[tuple[Any, dict[str, Any]]] = []
+                parse_error_outputs: list[dict[str, Any]] = []
                 for item in tool_calls:
                     raw_args = item.function.arguments if isinstance(item.function.arguments, str) else json.dumps(
                         item.function.arguments
                     )
-                    parsed_args = json.loads(raw_args or "{}")
+                    try:
+                        parsed_args = _parse_tool_arguments(raw_args, tool_name=item.function.name)
+                    except ValueError as exc:
+                        logger.warning(
+                            "role_tool_call_failed",
+                            extra={
+                                "role": role,
+                                "tool_name": item.function.name,
+                                "workspace_id": workspace.workspace_id,
+                                "error_type": "InvalidToolArguments",
+                                "error": str(exc),
+                            },
+                        )
+                        parse_error_outputs.append(_invalid_tool_call_output(item=item, error=str(exc)))
+                        continue
                     if item.function.name == "submit_result":
                         parsed_args["usage"] = usage.to_dict()
                         if role_trace is not None:
@@ -789,7 +969,9 @@ class OpenAIRoleRunner:
                         )
                     )
 
-                if all(tools[item.name].invocation_is_read_only(args) for item, args in pending_tool_calls):
+                if parse_error_outputs:
+                    tool_outputs = parse_error_outputs
+                elif all(tools[item.name].invocation_is_read_only(args) for item, args in pending_tool_calls):
                     tool_outputs = list(
                         await asyncio.gather(
                             *[
@@ -798,20 +980,22 @@ class OpenAIRoleRunner:
                                     workspace=workspace,
                                     tools=tools,
                                     item=item,
+                                    parsed_args=args,
                                 )
-                                for item, _ in pending_tool_calls
+                                for item, args in pending_tool_calls
                             ]
                         )
                     )
                 else:
                     tool_outputs = []
-                    for item, _ in pending_tool_calls:
+                    for item, args in pending_tool_calls:
                         tool_outputs.append(
                             await self._execute_tool_call(
                                 role=role,
                                 workspace=workspace,
                                 tools=tools,
                                 item=item,
+                                parsed_args=args,
                             )
                         )
 
@@ -932,6 +1116,21 @@ class OpenAIRoleRunner:
         _require_path(result["e2e_plan_path"], expected_e2e_plan_path, label="e2e plan")
 
         execution_contract = self._artifact_service.read_artifact(workspace, result["execution_contract_path"])
+        normalized_execution_contract_meta = _normalize_execution_contract_meta(
+            execution_contract.meta,
+            run_id=run_id,
+        )
+        if normalized_execution_contract_meta != execution_contract.meta:
+            self._artifact_service.write_artifact(
+                workspace,
+                result["execution_contract_path"],
+                normalized_execution_contract_meta,
+                execution_contract.body,
+            )
+            execution_contract = self._artifact_service.read_artifact(
+                workspace,
+                result["execution_contract_path"],
+            )
         _require_frontmatter_fields(
             execution_contract.meta,
             path=result["execution_contract_path"],
@@ -945,6 +1144,18 @@ class OpenAIRoleRunner:
         )
 
         plan_doc = self._artifact_service.read_artifact(workspace, result["plan_path"])
+        normalized_plan_meta = _normalize_architecture_plan_meta(
+            plan_doc.meta,
+            run_id=run_id,
+        )
+        if normalized_plan_meta != plan_doc.meta:
+            self._artifact_service.write_artifact(
+                workspace,
+                result["plan_path"],
+                normalized_plan_meta,
+                plan_doc.body,
+            )
+            plan_doc = self._artifact_service.read_artifact(workspace, result["plan_path"])
         _require_frontmatter_fields(
             plan_doc.meta,
             path=result["plan_path"],
@@ -956,8 +1167,24 @@ class OpenAIRoleRunner:
             field="run_id",
             expected=run_id,
         )
+        _validate_stage_dev_boundaries(
+            [dict(stage) for stage in plan_doc.meta.get("stages", [])],
+            path=result["plan_path"],
+        )
 
         e2e_plan = self._artifact_service.read_artifact(workspace, result["e2e_plan_path"])
+        normalized_e2e_plan_meta = _normalize_e2e_plan_meta(
+            e2e_plan.meta,
+            run_id=run_id,
+        )
+        if normalized_e2e_plan_meta != e2e_plan.meta:
+            self._artifact_service.write_artifact(
+                workspace,
+                result["e2e_plan_path"],
+                normalized_e2e_plan_meta,
+                e2e_plan.body,
+            )
+            e2e_plan = self._artifact_service.read_artifact(workspace, result["e2e_plan_path"])
         _require_frontmatter_fields(
             e2e_plan.meta,
             path=result["e2e_plan_path"],
@@ -1243,7 +1470,7 @@ class OpenAIRoleRunner:
             "properties": {
                 "decision": {"type": "string", "enum": ["PASS", "REWORK"]},
                 "decision_path": {"type": "string"},
-                "rework_summary_path": {"type": "string"},
+                "rework_summary_path": {"type": ["string", "null"]},
                 "summary": {"type": "string"},
             },
             "required": ["decision", "decision_path", "rework_summary_path", "summary"],
@@ -1260,6 +1487,13 @@ class OpenAIRoleRunner:
         )
         decision_path = f"/workspace/.autogen/runs/{state['run_id']}/40-release/release-{release_no:03d}/decision.md"
         rework_path = f"/workspace/.autogen/runs/{state['run_id']}/50-rework/release-{release_no:03d}/rework-summary.md"
+        rework_exists = workspace.to_backing_path(rework_path).exists()
+        if result["decision"] != "REWORK":
+            # For PASS, trust the actual artifact presence over any placeholder
+            # or echoed path in the structured output.
+            result["rework_summary_path"] = rework_path if rework_exists else None
+        elif result["rework_summary_path"] == "":
+            result["rework_summary_path"] = None
         _require_path(result["decision_path"], decision_path, label="release decision")
         decision_artifact = self._artifact_service.read_artifact(workspace, result["decision_path"])
         normalized_decision_meta = _normalize_release_decision_meta(

@@ -11,7 +11,14 @@ import pytest
 
 from orchestrator.models.runtime import VISIBLE_ROOT, WorkspaceView
 from orchestrator.services.artifact_service import ArtifactService
-from orchestrator.services.role_runner import OpenAIRoleRunner
+from orchestrator.services.role_runner import (
+    OpenAIRoleRunner,
+    _contains_stage_dev_browser_execution,
+    _normalize_architecture_plan_meta,
+    _normalize_e2e_plan_meta,
+    _normalize_execution_contract_meta,
+    _validate_stage_dev_boundaries,
+)
 from orchestrator.tools.base import ToolSpec
 
 
@@ -329,6 +336,78 @@ async def test_role_runner_can_use_stateless_followups():
             "output": '{"value": 1}',
         },
     ]
+
+
+@pytest.mark.anyio
+async def test_chat_completions_invalid_tool_json_becomes_recoverable_tool_error():
+    async def should_not_run(_args):
+        raise AssertionError("invalid JSON tool call should not reach the handler")
+
+    tools = {
+        "write_markdown_artifact": ToolSpec(
+            name="write_markdown_artifact",
+            description="write markdown artifact",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "frontmatter": {"type": "object"},
+                    "body": {"type": "string"},
+                },
+                "required": ["path", "frontmatter", "body"],
+            },
+            handler=should_not_run,
+            read_only=False,
+        ),
+    }
+    client = FakeClient(
+        chat_sequence=[
+            _chat_completion(
+                [
+                    _chat_tool_call(
+                        "write_markdown_artifact",
+                        '{"path": "/workspace/out.md", "frontmatter": {}, "body": "oops"',
+                        call_id="call-1",
+                    )
+                ],
+                input_tokens=10,
+                output_tokens=5,
+            ),
+            _chat_completion(
+                [
+                    _chat_tool_call(
+                        "submit_result",
+                        '{"summary": "done"}',
+                        call_id="call-2",
+                    )
+                ],
+                input_tokens=4,
+                output_tokens=2,
+            ),
+        ]
+    )
+    runner = RoleRunnerHarness(client, tools, api_mode="chat_completions")
+
+    result = await runner._run_role(
+        role="architect",
+        model="gpt-test",
+        user_prompt="hello",
+        state={"run_id": "run-1", "cycle_no": 1},
+        workspace=SimpleNamespace(workspace_id="ws-1"),
+        container_id="container-1",
+        result_schema={
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+            "additionalProperties": False,
+        },
+    )
+
+    assert result["summary"] == "done"
+    assert len(client.chat.completions.calls) == 2
+    followup_messages = client.chat.completions.calls[1]["messages"]
+    tool_message = next(message for message in followup_messages if message["role"] == "tool")
+    assert "InvalidToolArguments" in tool_message["content"]
 
 
 @pytest.mark.anyio
@@ -736,6 +815,58 @@ async def test_run_release_gate_normalizes_sparse_decision_frontmatter(tmp_path)
     assert artifact.meta["decision"] == "PASS"
 
 
+@pytest.mark.anyio
+async def test_run_release_gate_ignores_placeholder_rework_path_for_pass_without_artifact(tmp_path):
+    workspace = _workspace(tmp_path)
+    artifact_service = ArtifactService()
+    decision_path = "/workspace/.autogen/runs/run-1/40-release/release-001/decision.md"
+    rework_path = "/workspace/.autogen/runs/run-1/50-rework/release-001/rework-summary.md"
+    artifact_service.write_artifact(
+        workspace,
+        decision_path,
+        {
+            "kind": "release_decision",
+        },
+        "Ship it.\n",
+    )
+    runner = OpenAIRoleRunner(
+        DummyConfig(),
+        None,
+        artifact_service,
+        SimpleNamespace(),
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    async def fake_run_role(**kwargs):
+        del kwargs
+        return {
+            "decision": "PASS",
+            "decision_path": decision_path,
+            "rework_summary_path": rework_path,
+            "summary": "ok",
+        }
+
+    runner._run_role = fake_run_role  # type: ignore[method-assign]
+
+    result = await runner.run_release_gate(
+        state={
+            "run_id": "run-1",
+            "release_no": 1,
+            "execution_contract_path": "/workspace/.autogen/runs/run-1/10-planning/cycle-001/execution-contract.md",
+            "review_results": {
+                "compliance": {"report_path": "/workspace/.autogen/runs/run-1/30-reviews/release-001/compliance/report.md"}
+            },
+        },
+        workspace=workspace,
+        container_id="container-1",
+    )
+
+    assert result["decision"] == "PASS"
+    assert result["rework_summary_path"] is None
+    assert not workspace.to_backing_path(rework_path).exists()
+
+
 def test_build_tools_only_adds_file_write_tools_for_e2e_review_role(tmp_path):
     workspace = _workspace(tmp_path)
     runner = OpenAIRoleRunner(
@@ -766,3 +897,98 @@ def test_build_tools_only_adds_file_write_tools_for_e2e_review_role(tmp_path):
     assert "replace_in_file" in e2e_tools
     assert "write_file" not in qa_tools
     assert "replace_in_file" not in qa_tools
+
+
+def test_stage_dev_boundary_allows_repo_owned_e2e_assets_without_browser_execution():
+    _validate_stage_dev_boundaries(
+        [
+            {
+                "stage_id": "s5-e2e-and-polish",
+                "goal": "Add Playwright config and repo-owned E2E specs.",
+                "exit_criteria": [
+                    "playwright.config.ts exists and references the acceptance scenario",
+                    "README.md documents test:e2e usage",
+                    "`bun run build` succeeds",
+                ],
+            }
+        ],
+        path="/workspace/.autogen/runs/run-1/10-planning/cycle-001/architecture-plan.md",
+    )
+
+
+def test_stage_dev_boundary_allows_configured_e2e_script_without_execution():
+    assert not _contains_stage_dev_browser_execution("`bun run test:e2e` script configured")
+
+    _validate_stage_dev_boundaries(
+        [
+            {
+                "stage_id": "s5-e2e-and-polish",
+                "goal": "Add Playwright E2E coverage.",
+                "exit_criteria": [
+                    "`bun run test:e2e` script configured",
+                ],
+            }
+        ],
+        path="/workspace/.autogen/runs/run-1/10-planning/cycle-001/architecture-plan.md",
+    )
+
+
+def test_stage_dev_boundary_rejects_browser_execution_exit_criteria():
+    assert _contains_stage_dev_browser_execution("`bun run test:e2e` passes")
+
+    with pytest.raises(RuntimeError, match="stage-dev/browser boundary"):
+        _validate_stage_dev_boundaries(
+            [
+                {
+                    "stage_id": "s5-e2e-and-polish",
+                    "goal": "Add Playwright E2E coverage.",
+                    "exit_criteria": [
+                        "`bun run test:e2e` passes the main acceptance scenario",
+                    ],
+                }
+            ],
+            path="/workspace/.autogen/runs/run-1/10-planning/cycle-001/architecture-plan.md",
+        )
+
+
+def test_planning_meta_normalizers_correct_core_frontmatter_fields():
+    execution_meta = _normalize_execution_contract_meta(
+        {
+            "kind": "execution_contract",
+            "run_id": "run-wrong",
+            "role": "architect",
+            "created_at": "2026-04-06T17:46:00Z",
+            "run_branch": "autogen/run-wrong",
+        },
+        run_id="run-1",
+    )
+    assert execution_meta["run_id"] == "run-1"
+    assert execution_meta["run_branch"] == "autogen/run-wrong"
+
+    plan_meta = _normalize_architecture_plan_meta(
+        {
+            "kind": "architecture_plan",
+            "run_id": "run-wrong",
+            "role": "architect",
+            "created_at": "2026-04-06T17:46:00Z",
+            "stage_count": 99,
+            "stages": [{"stage_id": "stage-001", "goal": "g", "inputs": [], "exit_criteria": []}],
+        },
+        run_id="run-1",
+    )
+    assert plan_meta["run_id"] == "run-1"
+    assert plan_meta["stage_count"] == 1
+
+    e2e_meta = _normalize_e2e_plan_meta(
+        {
+            "kind": "e2e_plan",
+            "run_id": "run-wrong",
+            "role": "architect",
+            "created_at": "2026-04-06T17:46:00Z",
+            "scenario_count": 99,
+            "scenarios": [{"scenario_id": "happy-path"}],
+        },
+        run_id="run-1",
+    )
+    assert e2e_meta["run_id"] == "run-1"
+    assert e2e_meta["scenario_count"] == 1

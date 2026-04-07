@@ -12,6 +12,24 @@ from orchestrator.models.runtime import ContainerHandle, ExecResult, WorkspaceVi
 
 logger = logging.getLogger(__name__)
 
+_EXEC_ENV = {
+    "HOME": "/home/autogen",
+    "BUN_INSTALL": "/opt/bun",
+    # Keep Bun's package cache on the writable shared state mount. The
+    # Playwright browser image's default cache location can report
+    # AccessDenied during `bun install`, even when TMPDIR itself is writable.
+    "BUN_INSTALL_CACHE_DIR": "/autogen-state/tasks/tmp/bun-cache",
+    "PATH": "/opt/bun/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PLAYWRIGHT_BROWSERS_PATH": "/ms-playwright",
+    # Browser images already provide Playwright browsers. Skipping download keeps
+    # `bun install` from trying to repopulate `/ms-playwright` during e2e review.
+    "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
+    # Bun uses the process temp directory for package extraction. Point it at the
+    # writable shared state mount because the browser image's default tempdir is
+    # not writable for the non-root `autogen` exec user.
+    "TMPDIR": "/autogen-state/tasks/tmp",
+}
+
 
 class DockerManager:
     def __init__(self, config: OrchestratorConfig) -> None:
@@ -98,7 +116,9 @@ class DockerManager:
                 demux=True,
                 tty=False,
                 user="autogen",
-                environment={"HOME": "/home/autogen"},
+                # Preserve Bun and Playwright-related environment for shell-based execs
+                # and background tasks launched inside the agent containers.
+                environment=_EXEC_ENV,
                 stdout=True,
                 stderr=True,
             )
@@ -135,6 +155,13 @@ class DockerManager:
             },
         )
         return result
+
+    async def resolve_container_id(self, name_or_id: str) -> str | None:
+        try:
+            container = await asyncio.to_thread(self._client.containers.get, name_or_id)
+        except NotFound:
+            return None
+        return container.id
 
     async def remove_container(self, container_id: str, force: bool = True) -> None:
         try:

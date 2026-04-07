@@ -8,3 +8,9 @@ def test_load_role_prompt_includes_bundled_skills():
     assert "You are the developer role for the Autogen v1 harness." in prompt
     assert "[Skill: stage-implementation]" in prompt
     assert "background task" in prompt
+
+
+def test_load_e2e_prompt_includes_playwright_skill():
+    prompt = load_role_prompt("e2e")
+    assert "[Skill: playwright-best-practices]" in prompt
+    assert "Keep the validation loop tight" in prompt

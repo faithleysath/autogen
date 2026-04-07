@@ -40,6 +40,18 @@ class LocalDockerManager:
         )
 
 
+class RecordingDockerManager:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    async def exec(self, *, container_id: str, cmd: list[str], cwd: str, timeout_seconds: int) -> ExecResult:
+        del container_id, cwd, timeout_seconds
+        self.calls.append(cmd)
+        if cmd[:2] == ["sh", "-c"] and "echo $!" in cmd[2]:
+            return ExecResult(cmd=cmd, cwd="/workspace", exit_code=0, stdout="123\n", stderr="")
+        return ExecResult(cmd=cmd, cwd="/workspace", exit_code=0, stdout="", stderr="")
+
+
 def _workspace(tmp_path) -> WorkspaceView:
     return WorkspaceView(
         workspace_id="stage-001-dev",
@@ -112,3 +124,23 @@ async def test_background_task_manager_stops_running_task(tmp_path):
     stopped = await manager.stop_task(task_id=task["task_id"])
     assert stopped["status"] == "stopped"
     assert stopped["exit_code"] == -15
+
+
+@pytest.mark.anyio
+async def test_background_task_manager_uses_non_login_shell_for_command_tasks(tmp_path):
+    docker = RecordingDockerManager()
+    manager = BackgroundTaskManager(
+        docker_manager=docker,
+        tasks_root=tmp_path / "_state" / "tasks",
+    )
+
+    await manager.create_command_task(
+        workspace=_workspace(tmp_path),
+        container_id="container-1",
+        role="e2e",
+        description="start preview server",
+        argv=["bun", "run", "preview"],
+        cwd="/workspace",
+    )
+
+    assert docker.calls[0][:2] == ["sh", "-c"]

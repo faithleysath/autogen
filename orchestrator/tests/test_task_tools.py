@@ -87,6 +87,24 @@ async def test_task_create_allows_e2e_background_tasks_without_code_write(tmp_pa
 
 
 @pytest.mark.anyio
+async def test_task_create_allows_e2e_absolute_bun_path(tmp_path):
+    context = _make_context(tmp_path, role="e2e")
+    background_tasks = FakeBackgroundTaskManager()
+    tool = TaskToolset(context, background_tasks)
+
+    result = await tool.task_create(
+        {
+            "description": "start preview server",
+            "argv": ["/opt/bun/bin/bun", "run", "preview"],
+            "cwd": "/workspace",
+        }
+    )
+
+    assert result == {"task_id": "task-1", "status": "running"}
+    assert background_tasks.calls[0]["argv"] == ["/opt/bun/bin/bun", "run", "preview"]
+
+
+@pytest.mark.anyio
 async def test_task_create_rejects_roles_without_background_task_permission(tmp_path):
     context = _make_context(tmp_path, role="architect")
     tool = TaskToolset(context, FakeBackgroundTaskManager())

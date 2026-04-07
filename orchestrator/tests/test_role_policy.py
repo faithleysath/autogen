@@ -58,3 +58,7 @@ def test_e2e_can_write_evidence_dir_and_start_background_tasks_without_code_writ
         "/workspace/.autogen/runs/run-1/30-reviews/release-002/e2e/evidence"
     )
     assert not policy.can_write("/workspace/src/app.tsx")
+    assert policy.can_access_external_path("/ms-playwright")
+    assert policy.can_access_external_path("/ms-playwright/chromium-1234")
+    assert policy.can_access_external_path("/opt/bun/bin/bun")
+    assert not policy.can_access_external_path("/etc/hosts")
